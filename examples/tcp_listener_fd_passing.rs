@@ -27,10 +27,7 @@ mod unix_example {
     use std::{
         convert::Infallible,
         env, io,
-        os::unix::{
-            io::{AsRawFd, FromRawFd, RawFd},
-            net::UnixStream,
-        },
+        os::unix::io::{AsRawFd, FromRawFd, RawFd},
         process::{Command, Stdio},
         time::Duration,
     };
@@ -38,7 +35,7 @@ mod unix_example {
     use rama::{
         error::BoxError, graceful::Shutdown, http::Request, http::server::HttpServer,
         http::service::web::response::Json, rt::Executor, service::service_fn,
-        tcp::server::TcpListener,
+        tcp::server::TcpListener, unix::TokioUnixStream, unix::server::UnixListener,
     };
     use serde_json::json;
 
@@ -76,11 +73,8 @@ mod unix_example {
         let addr = listener.local_addr()?;
         println!("✓ Listening on {addr}");
 
-        // Clean up old socket file
-        let _ = std::fs::remove_file(SOCKET_PATH);
-
-        // Create Unix socket to communicate with child
-        let unix_listener = std::os::unix::net::UnixListener::bind(SOCKET_PATH)?;
+        // Create Unix socket to communicate with child (rama::unix handles cleanup on drop)
+        let unix_listener = UnixListener::bind_path(SOCKET_PATH).await?;
         println!("✓ Created control socket at {SOCKET_PATH}");
 
         // Convert to std listener for FD passing
@@ -101,12 +95,12 @@ mod unix_example {
 
         // Wait for child to connect
         println!("\nWaiting for child to connect...");
-        let (stream, _) = unix_listener.accept()?;
+        let (stream, _) = unix_listener.accept().await?;
         println!("✓ Child connected");
 
-        // Send the FD via SCM_RIGHTS
+        // Send the FD via SCM_RIGHTS (libc required - no stable Rust API for ancillary data)
         println!("\nTransferring listener FD...");
-        send_fd(&stream, std_listener.as_raw_fd())?;
+        send_fd(stream.stream.as_raw_fd(), std_listener.as_raw_fd())?;
         println!("✓ FD transferred");
 
         // Close our copy of the listener
@@ -121,9 +115,7 @@ mod unix_example {
         // Wait for child to finish (it will run for 10 seconds)
         let _ = child.wait();
 
-        // Cleanup
-        let _ = std::fs::remove_file(SOCKET_PATH);
-
+        // unix_listener cleanup happens automatically on drop
         Ok(())
     }
 
@@ -134,13 +126,13 @@ mod unix_example {
         println!("\n=== Child Process ===");
         println!("Connecting to parent...");
 
-        // Connect to parent's Unix socket
-        let stream = UnixStream::connect(SOCKET_PATH)?;
+        // Connect to parent's Unix socket using rama::unix
+        let stream = TokioUnixStream::connect(SOCKET_PATH).await?;
         println!("✓ Connected to parent");
 
-        // Receive the FD
+        // Receive the FD via SCM_RIGHTS (libc required - no stable Rust API for ancillary data)
         println!("Receiving listener FD...");
-        let fd = recv_fd(&stream)?;
+        let fd = recv_fd(stream.as_raw_fd())?;
         println!("✓ Received FD: {fd}");
 
         // Reconstruct std listener from FD
@@ -183,9 +175,7 @@ mod unix_example {
     }
 
     /// Send a file descriptor via Unix domain socket using SCM_RIGHTS
-    fn send_fd(stream: &UnixStream, fd: RawFd) -> io::Result<()> {
-        let sock_fd = stream.as_raw_fd();
-
+    fn send_fd(sock_fd: RawFd, fd: RawFd) -> io::Result<()> {
         // Prepare iovec with dummy byte
         let dummy = [b'F'];
         let mut iov = libc::iovec {
@@ -232,9 +222,7 @@ mod unix_example {
     }
 
     /// Receive a file descriptor via Unix domain socket using SCM_RIGHTS
-    fn recv_fd(stream: &UnixStream) -> io::Result<RawFd> {
-        let sock_fd = stream.as_raw_fd();
-
+    fn recv_fd(sock_fd: RawFd) -> io::Result<RawFd> {
         // Prepare control message buffer
         let cmsg_space = unsafe { libc::CMSG_SPACE(std::mem::size_of::<RawFd>() as libc::c_uint) };
         let mut cmsg_buf = vec![0u8; cmsg_space as usize];
