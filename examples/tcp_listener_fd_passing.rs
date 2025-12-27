@@ -35,7 +35,8 @@ mod unix_example {
     use rama::{
         error::BoxError, graceful::Shutdown, http::Request, http::server::HttpServer,
         http::service::web::response::Json, rt::Executor, service::service_fn,
-        tcp::server::TcpListener, unix::TokioUnixStream, unix::server::UnixListener,
+        tcp::server::TcpListener,
+        unix::{server::UnixListener, TokioUnixStream, UnixStream},
     };
     use serde_json::json;
 
@@ -127,12 +128,12 @@ mod unix_example {
         println!("Connecting to parent...");
 
         // Connect to parent's Unix socket using rama::unix
-        let stream = TokioUnixStream::connect(SOCKET_PATH).await?;
+        let stream: UnixStream = TokioUnixStream::connect(SOCKET_PATH).await?.into();
         println!("✓ Connected to parent");
 
         // Receive the FD via SCM_RIGHTS (libc required - no stable Rust API for ancillary data)
         println!("Receiving listener FD...");
-        let fd = recv_fd(stream.as_raw_fd())?;
+        let fd = recv_fd(stream.stream.as_raw_fd())?;
         println!("✓ Received FD: {fd}");
 
         // Reconstruct std listener from FD
