@@ -55,6 +55,7 @@ tokio-util = { workspace = true, optional = true }
 divan = { workspace = true }
 rama-http = { workspace = true }
 rama-http-backend = { workspace = true }
+rama-net = { workspace = true, features = ["test-utils"] }
 rama-tls = { workspace = true }
 rama-tls-boring = { workspace = true, features = ["http"] }
 rama-tls-rustls = { workspace = true, features = ["ring"] }

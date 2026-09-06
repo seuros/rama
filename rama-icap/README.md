@@ -31,7 +31,7 @@ default and can target c-icap through a command-line service URI.
 
 [example]: https://github.com/plabayo/rama/blob/main/examples/src/http_icap_proxy.rs
 
-Use [`codec`](https://docs.rs/rama-icap/latest/rama_icap/codec/) for borrowed
+Use [`codec`](https://ramaproxy.org/docs/rama/icap/codec/index.html) for borrowed
 wire syntax, the streaming `client` and `server` modules for standalone ICAP,
 and `http::layer::AdaptationLayer` to detour HTTP requests or responses.
 

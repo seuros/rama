@@ -1939,7 +1939,10 @@ async fn parses_partial_content_draft_figure_5() {
     tokio::join!(server, client);
 }
 
-#[tokio::test]
+// These bounded duplex exchanges use virtual time so a busy CI runner cannot
+// exhaust the deadlock deadline while the peers are still making progress.
+// Tokio advances to the timeout if both peers stall without waking each other.
+#[tokio::test(start_paused = true)]
 async fn early_response_is_monitored_without_full_duplex_deadlock() {
     let exchange = async {
         let (client_io, server_io) = tokio::io::duplex(64);
@@ -1990,7 +1993,7 @@ async fn early_response_is_monitored_without_full_duplex_deadlock() {
         .expect("early response exchange deadlocked");
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn body_bearing_early_response_uses_close_fallback() {
     let exchange = async {
         let (client_io, mut server_io) = tokio::io::duplex(64);
@@ -2186,7 +2189,7 @@ async fn failed_early_response_shutdown_is_retried() {
     .expect("retrying a failed shutdown deadlocked");
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn early_response_keeps_draining_for_connection_reuse() {
     let exchange = async {
         let (client_io, server_io) = tokio::io::duplex(64);
