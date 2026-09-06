@@ -158,7 +158,6 @@ impl DemoTcpMitmService {
         let http_mitm_svc = HttpMitmRelay::new(exec.clone()).with_http_middleware(
             self.http_relay_middleware(exec.clone(), within_connect_tunnel, settings.clone()),
         );
-
         // `promote_passthrough` is ONLY safe on a raw kernel-flow ↔
         // NWConnection bridge — see `PromoteHandle`'s safety contract.
         // Inside TLS / HTTP MITM the bridge carries post-decryption
@@ -303,5 +302,139 @@ impl Service<BridgeIo<TcpFlow, NwTcpStream>> for TcpInterceptService {
         let mitm_svc = self.mitm.new_bridge_service(flow_exec, false);
 
         mitm_svc.serve(BridgeIo(ingress, egress)).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rama::utils::octets::{kib, mib};
+    use rama::{ServiceInput, crypto::cert::boring::generate_certificate_authority_x509};
+    use tokio::{
+        io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader, duplex},
+        sync::oneshot,
+    };
+
+    #[tokio::test]
+    async fn http_response_drains_after_client_write_half_close() {
+        // Build the real application router without reading or changing the system keychain.
+        let (cert, key) = generate_certificate_authority_x509(&Default::default()).unwrap();
+        let settings = LiveSettings {
+            html_badge_enabled: false,
+            html_badge_label: String::new(),
+            exclude_domains: Vec::new(),
+            ca_crt_pem: cert.to_pem().unwrap().into(),
+            tls_mitm_relay: TlsMitmRelay::new_cached_in_memory(cert, key),
+            tls_keylog_toggle: ToggleableKeyLogSink::new(NoopKeyLogSink).toggle(),
+        };
+        let mitm = DemoTcpMitmService {
+            state: Arc::new(arc_swap::ArcSwap::from_pointee(settings)),
+            peek_duration_s: 0.5,
+        };
+
+        for within_connect_tunnel in [false, true] {
+            for body_len in [kib(64), mib(1)] {
+                for eager_buffered in [false, true] {
+                    tokio::time::timeout(Duration::from_secs(10), async {
+                        let body: Vec<u8> = (0..body_len).map(|i| (i % 251) as u8).collect();
+                        let request_headers = format!(
+                            "POST /octet-stream HTTP/1.1\r\nHost: upstream.test\r\n\
+                             Content-Type: application/octet-stream\r\n\
+                             Content-Length: {body_len}\r\nConnection: close\r\n\r\n"
+                        );
+                        // Streaming exercises backpressure; eager buffering puts the complete
+                        // request and FIN before the router's very first poll.
+                        let ingress_capacity = if eager_buffered {
+                            request_headers.len() + body.len() + 1
+                        } else {
+                            4096
+                        };
+                        let (mut client, ingress) = duplex(ingress_capacity);
+                        let (egress, origin) = duplex(4096);
+                        let relay =
+                            mitm.new_bridge_service(Executor::default(), within_connect_tunnel);
+                        let (write_closed, after_write_close) = oneshot::channel();
+                        let (responding, response_started) = oneshot::channel();
+
+                        if eager_buffered {
+                            client.write_all(request_headers.as_bytes()).await.unwrap();
+                            client.write_all(&body).await.unwrap();
+                            client.shutdown().await.unwrap();
+                        }
+                        let client_exchange = async {
+                            if !eager_buffered {
+                                client.write_all(request_headers.as_bytes()).await.unwrap();
+                                client.write_all(&body).await.unwrap();
+                                client.shutdown().await.unwrap();
+                            }
+                            write_closed.send(()).unwrap();
+                            if !eager_buffered {
+                                response_started.await.unwrap();
+                                // Exercise backpressure while response bytes are waiting to drain.
+                                tokio::time::sleep(Duration::from_millis(25)).await;
+                            }
+                            let mut response = Vec::new();
+                            client.read_to_end(&mut response).await.unwrap();
+                            let boundary = response
+                                .windows(4)
+                                .position(|w| w == b"\r\n\r\n")
+                                .expect("complete response headers");
+                            let headers = std::str::from_utf8(&response[..boundary]).unwrap();
+                            assert!(headers.starts_with("HTTP/1.1 200 OK\r\n"), "{headers}");
+                            assert!(
+                                headers
+                                    .to_ascii_lowercase()
+                                    .contains("x-rama-tproxy-observed:")
+                            );
+                            assert_eq!(&response[boundary + 4..], body.as_slice());
+                        };
+                        let origin_exchange = async {
+                            // A separately framed upstream, independent of HTTP server EOF defaults.
+                            let mut origin = BufReader::new(origin);
+                            let mut headers = String::new();
+                            loop {
+                                let start = headers.len();
+                                assert_ne!(origin.read_line(&mut headers).await.unwrap(), 0);
+                                if &headers[start..] == "\r\n" {
+                                    break;
+                                }
+                            }
+                            assert!(headers.starts_with("POST /octet-stream HTTP/1.1\r\n"));
+                            assert!(
+                                headers
+                                    .to_ascii_lowercase()
+                                    .contains(&format!("content-length: {body_len}\r\n"))
+                            );
+                            let mut received = vec![0; body_len];
+                            origin.read_exact(&mut received).await.unwrap();
+                            assert_eq!(received, body);
+                            after_write_close.await.unwrap();
+                            // The response is deliberately unavailable until after the client's FIN.
+                            if !eager_buffered {
+                                responding.send(()).unwrap();
+                            }
+                            let headers = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\
+                                 Content-Length: {body_len}\r\nConnection: close\r\n\r\n"
+                            );
+                            origin.write_all(headers.as_bytes()).await.unwrap();
+                            origin.write_all(&received).await.unwrap();
+                            origin.shutdown().await.unwrap();
+                        };
+                        let (result, (), ()) = tokio::join!(
+                            relay.serve(BridgeIo(
+                                ServiceInput::new(ingress),
+                                ServiceInput::new(egress)
+                            )),
+                            client_exchange,
+                            origin_exchange,
+                        );
+                        result.unwrap();
+                    })
+                    .await
+                    .expect("HTTP half-close exchange and relay must finish");
+                }
+            }
+        }
     }
 }

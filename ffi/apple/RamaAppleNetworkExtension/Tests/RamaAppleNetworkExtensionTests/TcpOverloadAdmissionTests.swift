@@ -68,7 +68,89 @@ final class TcpOverloadAdmissionTests: XCTestCase {
         core.testFinishTcpStart(readyToken, outcome: .ready)
         core.testFinishTcpStart(timeoutToken, outcome: .timeout)
 
-        waitFor("in-flight gauge drains") { core.testTcpStartsInFlight == 0 }
+        XCTAssertEqual(core.testTcpStartsInFlight, 0)
+    }
+
+    func testStartCompletionUsesCapturedInstantWhenStateQueueIsBacklogged() {
+        defaultTcpStartInFlightHardCap = 10
+        let core = TransparentProxyCore()
+        let token = admittedToken(core, NSObject())
+        let gate = core.testHoldStateQueue()
+
+        core.testFinishTcpStart(token, outcome: .ready, latencyMs: 7)
+        gate.signal()
+
+        XCTAssertEqual(core.testTcpStartsInFlight, 0)
+        XCTAssertEqual(core.testTcpStartLatencySampleCount, 1)
+        XCTAssertEqual(core.testTcpStartLatencyPercentile(0.95), 7)
+    }
+
+    func testStaleCompletionCannotFinishSameGenerationReplacementAdmission() {
+        defaultTcpStartInFlightHardCap = 10
+        let core = TransparentProxyCore()
+        let reusedFlowIdentity = NSObject()
+
+        let oldToken = admittedToken(core, reusedFlowIdentity)
+        core.testFinishTcpStart(oldToken, outcome: .ready)
+        XCTAssertEqual(core.testTcpStartsInFlight, 0)
+
+        let replacementToken = admittedToken(core, reusedFlowIdentity)
+        XCTAssertEqual(
+            oldToken.identity.engineGeneration,
+            replacementToken.identity.engineGeneration)
+        XCTAssertNotEqual(oldToken.identity.nonce, replacementToken.identity.nonce)
+        let latencySamplesBeforeStaleCompletion = core.testTcpStartLatencySampleCount
+        let timeoutsBeforeStaleCompletion = core.testTcpTimeoutsSinceTick
+
+        core.testFinishTcpStart(oldToken, outcome: .timeout)
+
+        XCTAssertEqual(core.testTcpStartsInFlight, 1)
+        XCTAssertEqual(core.testTcpLiveFlowReservations, 1)
+        XCTAssertEqual(
+            core.testTcpStartLatencySampleCount,
+            latencySamplesBeforeStaleCompletion)
+        XCTAssertEqual(core.testTcpTimeoutsSinceTick, timeoutsBeforeStaleCompletion)
+
+        core.testFinishTcpStart(replacementToken, outcome: .failed)
+        XCTAssertEqual(core.testTcpStartsInFlight, 0)
+        XCTAssertEqual(core.testTcpLiveFlowReservations, 0)
+    }
+
+    func testRegistrationConsumesOnlyMatchingAdmissionReservation() {
+        defaultTcpStartInFlightHardCap = 10
+        let core = TransparentProxyCore()
+        let reusedFlowIdentity = NSObject()
+        let flowId = ObjectIdentifier(reusedFlowIdentity)
+
+        let oldToken = admittedToken(core, reusedFlowIdentity)
+        core.testFinishTcpStart(oldToken, outcome: .ready)
+        XCTAssertEqual(core.testTcpStartsInFlight, 0)
+        let currentToken = admittedToken(core, reusedFlowIdentity)
+        let context = TcpFlowContext()
+        let anchor = _TestTcpFlowSessionAnchor(ctx: context)
+
+        XCTAssertNil(
+            core.registerTcpFlow(
+                flowId,
+                anchor: anchor,
+                appId: currentToken.appId,
+                admissionToken: oldToken))
+        XCTAssertEqual(core.testTcpLiveFlowReservations, 1)
+        XCTAssertEqual(core.testTcpStartsInFlight, 1)
+
+        XCTAssertEqual(
+            core.registerTcpFlow(
+                flowId,
+                anchor: anchor,
+                appId: currentToken.appId,
+                admissionToken: currentToken),
+            1)
+        XCTAssertEqual(core.testTcpLiveFlowReservations, 0)
+
+        core.testFinishTcpStart(oldToken, outcome: .timeout)
+        XCTAssertEqual(core.testTcpStartsInFlight, 1)
+        core.testFinishTcpStart(currentToken, outcome: .ready)
+        XCTAssertEqual(core.testTcpStartsInFlight, 0)
     }
 
     func testLatencyBreakerRejectsAtSoftCapAfterSlowStart() {
@@ -80,12 +162,10 @@ final class TcpOverloadAdmissionTests: XCTestCase {
         let second = NSObject()
         let third = NSObject()
 
-        let firstToken = admittedToken(core, first)
+        _ = admittedToken(core, first)
         _ = admittedToken(core, second)
-        Thread.sleep(forTimeInterval: 0.005)
-        core.testFinishTcpStart(firstToken, outcome: .ready)
-
-        waitFor("breaker opens") { core.testTcpOverloadBreakerOpen }
+        core.testInsertTcpStartLatencyMs(5)
+        XCTAssertTrue(core.testTcpOverloadBreakerOpen)
 
         guard case .reject(let reason, _, _) = core.testAdmitTcpStart(
             flowId: ObjectIdentifier(third), meta: meta(bundleId: "com.example.third"))
@@ -110,15 +190,11 @@ final class TcpOverloadAdmissionTests: XCTestCase {
         let core = TransparentProxyCore()
         let captured = CapturedNotices()
         LifecycleLog.noticeOverride = { captured.append($0) }
-        let slow = NSObject()
         let second = NSObject()
         let third = NSObject()
         let fourth = NSObject()
 
-        let slowToken = admittedToken(core, slow)
-        Thread.sleep(forTimeInterval: 0.005)
-        core.testFinishTcpStart(slowToken, outcome: .ready)  // ~5ms > 1ms, but inFlight 0
-        waitFor("completion lands") { core.testTcpStartsInFlight == 0 }
+        core.testInsertTcpStartLatencyMs(5)
         XCTAssertFalse(core.testTcpOverloadBreakerOpen, "slow window without pressure stays closed")
 
         _ = admittedToken(core, second)  // inFlight 0 → 1, under the soft cap
@@ -150,7 +226,6 @@ final class TcpOverloadAdmissionTests: XCTestCase {
 
         _ = admittedToken(core, first)
         _ = admittedToken(core, second)
-        Thread.sleep(forTimeInterval: 0.005)  // pending starts age; that must not count
         guard case .admit = core.testAdmitTcpStart(flowId: ObjectIdentifier(third), meta: meta())
         else {
             XCTFail("pressure without slow completions is not overload; must be admitted")
@@ -171,14 +246,10 @@ final class TcpOverloadAdmissionTests: XCTestCase {
         let core = TransparentProxyCore()
         let captured = CapturedNotices()
         LifecycleLog.noticeOverride = { captured.append($0) }
-        let slow = NSObject()
         let second = NSObject()
         let third = NSObject()
 
-        let slowToken = admittedToken(core, slow)
-        Thread.sleep(forTimeInterval: 0.005)
-        core.testFinishTcpStart(slowToken, outcome: .ready)
-        waitFor("completion lands") { core.testTcpStartsInFlight == 0 }
+        core.testInsertTcpStartLatencyMs(5)
         _ = admittedToken(core, second)  // evaluates at inFlight 0: no pressure
         _ = admittedToken(core, third)  // evaluates at inFlight 1: no pressure
         XCTAssertFalse(core.testTcpOverloadBreakerOpen, "precondition: no event saw both")
@@ -204,43 +275,26 @@ final class TcpOverloadAdmissionTests: XCTestCase {
         let core = TransparentProxyCore()
         let captured = CapturedNotices()
         LifecycleLog.noticeOverride = { captured.append($0) }
-        let nowNs = DispatchTime.now().uptimeNanoseconds
-        // Fill the 128-sample window deterministically: `finishTcpStart` takes
-        // the latency from the token it is handed, so a backdated copy sets it.
+        // Fill the 128-sample window with exact completed-start latencies.
         for i in 0..<128 {
             let slow = i % 25 == 0
-            let token = admittedToken(core, NSObject())
-            let backdated = TcpAdmissionToken(
-                flowId: token.flowId,
-                startedAt: DispatchTime(
-                    uptimeNanoseconds: nowNs - (slow ? 5_000_000_000 : 100_000_000)),
-                appId: token.appId)
-            core.testFinishTcpStart(backdated, outcome: slow ? .timeout : .ready)
+            core.testInsertTcpStartLatencyMs(slow ? 5_000 : 100)
         }
-        waitFor("window filled") { core.testTcpStartsInFlight == 0 }
+        XCTAssertEqual(core.testTcpStartLatencySampleCount, 128)
         XCTAssertFalse(core.testTcpOverloadBreakerOpen)
-        // Pins that the backdated tokens really shaped the window (and so that
-        // `finishTcpStart` keeps taking latency from the handed token). The
-        // completions land a few ms after the backdated start, so match ranges.
+        XCTAssertEqual(core.testTcpStartLatencyPercentile(0.50), 100)
+        XCTAssertEqual(core.testTcpStartLatencyPercentile(0.95), 100)
+        XCTAssertEqual(core.testTcpStartLatencyPercentile(0.99), 5_000)
+
+        // The maintenance line must report the same exact distribution.
         core.testRunPeriodicMaintenance()
         let tick = captured.values.joined(separator: "\n")
-        let pattern = try! NSRegularExpression(pattern: #"startLatencyMs\[p50=(\d+),p95=(\d+),p99=(\d+)\]"#)
-        guard let match = pattern.firstMatch(in: tick, range: NSRange(tick.startIndex..., in: tick))
-        else {
-            XCTFail("no latency summary in tick: \(tick)")
-            return
-        }
-        func percentile(_ group: Int) -> Int {
-            Int(tick[Range(match.range(at: group), in: tick)!]) ?? -1
-        }
-        XCTAssertTrue((100..<200).contains(percentile(1)), "p50 ≈ 100ms, got \(percentile(1))")
-        XCTAssertTrue((100..<200).contains(percentile(2)), "p95 ≈ 100ms (tail is <5%), got \(percentile(2))")
-        XCTAssertGreaterThanOrEqual(percentile(3), 5_000, "p99 sees the 5s tail")
+        XCTAssertTrue(
+            tick.contains("startLatencyMs[p50=100,p95=100,p99=5000]"), tick)
 
         // Genuine pressure on top: 64 starts pending and ageing, none completing.
         let pending = (0..<64).map { _ in NSObject() }
         for object in pending { _ = admittedToken(core, object) }
-        Thread.sleep(forTimeInterval: 0.005)
         let probe = NSObject()
         guard case .admit = core.testAdmitTcpStart(flowId: ObjectIdentifier(probe), meta: meta())
         else {
@@ -249,6 +303,44 @@ final class TcpOverloadAdmissionTests: XCTestCase {
         }
         XCTAssertFalse(core.testTcpOverloadBreakerOpen)
     }
+
+    #if DEBUG || RAMA_TESTING
+        /// Admission and rejection paths may ask for p95 on every new flow.
+        /// Once a completion has refreshed the bounded sorted cache, those
+        /// reads must remain O(1) until another completion changes the window.
+        func testPercentilesReuseCacheAndStayCorrectAfterWindowEviction() {
+            var overload = TcpOverloadState()
+            for latency in 0..<128 {
+                overload.insertLatency(UInt64(latency))
+            }
+            XCTAssertEqual(overload.startLatencyCacheRefreshCount, 128)
+
+            let refreshesBeforeRejectionChecks = overload.startLatencyCacheRefreshCount
+            for _ in 0..<10_000 {
+                XCTAssertEqual(overload.percentile(0.95), 121)
+            }
+            XCTAssertEqual(
+                overload.startLatencyCacheRefreshCount,
+                refreshesBeforeRejectionChecks,
+                "unchanged-window admission checks must not rebuild the percentile cache")
+
+            // The 129th insertion evicts the oldest value (0), leaving 1...128.
+            overload.insertLatency(128)
+            XCTAssertEqual(overload.startLatencyMsWindow, Array(1...128).map(UInt64.init))
+            XCTAssertEqual(
+                overload.startLatencyCacheRefreshCount,
+                refreshesBeforeRejectionChecks + 1)
+
+            let snapshot = overload.snapshotAndResetRates(intervalSeconds: 60)
+            XCTAssertEqual(snapshot.p50StartMs, 65)
+            XCTAssertEqual(snapshot.p95StartMs, 122)
+            XCTAssertEqual(snapshot.p99StartMs, 127)
+            XCTAssertEqual(
+                overload.startLatencyCacheRefreshCount,
+                refreshesBeforeRejectionChecks + 1,
+                "one maintenance snapshot must reuse the same sorted view for p50/p95/p99")
+        }
+    #endif
 
     /// A refusal storm must not take the persisted log down with it: only the
     /// first few per-flow lines of a tick window are marked for persistence,
@@ -304,7 +396,7 @@ final class TcpOverloadAdmissionTests: XCTestCase {
 
         let token = admittedToken(core, NSObject(), bundleId: "com.example.browser")
         core.testFinishTcpStart(token, outcome: .timeout)
-        waitFor("in-flight gauge drains before telemetry") { core.testTcpStartsInFlight == 0 }
+        XCTAssertEqual(core.testTcpStartsInFlight, 0)
 
         core.testRunPeriodicMaintenance()
 
@@ -316,9 +408,15 @@ final class TcpOverloadAdmissionTests: XCTestCase {
         XCTAssertTrue(joined.contains("breaker="))
         XCTAssertTrue(joined.contains("hardCap=10"), "the cap the peak is measured against")
         XCTAssertTrue(joined.contains("shedHardCap=0"))
-        XCTAssertTrue(joined.contains("shedBreaker=0 shedApps=-"))
+        XCTAssertTrue(joined.contains("shedBreaker=0"))
+        XCTAssertTrue(joined.contains("shedLiveCapTcp=0"))
+        XCTAssertTrue(joined.contains("shedLiveCapUdp=0"))
+        XCTAssertTrue(joined.contains("shedApps=-"))
         XCTAssertTrue(
-            joined.contains("pressure[triggers=0 scans=0 skipped=0 evicted=0 spared=0 pending=0]"))
+            joined.contains(
+                "pressure[triggers=0 scans=0 skipped=0 selected=0 evicted=0 "
+                    + "spared=0 canceled=0 expired=0 pending=0]"
+            ))
     }
 
     /// A burst that came within a few starts of the hard cap but shed nothing
@@ -332,7 +430,7 @@ final class TcpOverloadAdmissionTests: XCTestCase {
         let objects = (0..<8).map { _ in NSObject() }
         let tokens = objects.map { admittedToken(core, $0) }
         for token in tokens.dropLast() { core.testFinishTcpStart(token, outcome: .ready) }
-        waitFor("gauge drains to one") { core.testTcpStartsInFlight == 1 }
+        XCTAssertEqual(core.testTcpStartsInFlight, 1)
 
         core.testRunPeriodicMaintenance()
 
@@ -369,15 +467,14 @@ final class TcpOverloadAdmissionTests: XCTestCase {
 
         XCTAssertEqual(core.testTcpConnectTimeoutMs(base: 10_000), 10_000)
 
-        let firstToken = admittedToken(core, first)
+        _ = admittedToken(core, first)
         XCTAssertEqual(
             core.testTcpConnectTimeoutMs(base: 10_000), 5_000,
             "soft-cap pressure clamps long connect timeouts")
 
         _ = admittedToken(core, second)
-        Thread.sleep(forTimeInterval: 0.005)
-        core.testFinishTcpStart(firstToken, outcome: .ready)
-        waitFor("breaker opens") { core.testTcpOverloadBreakerOpen }
+        core.testInsertTcpStartLatencyMs(5)
+        XCTAssertTrue(core.testTcpOverloadBreakerOpen)
 
         XCTAssertEqual(
             core.testTcpConnectTimeoutMs(base: 10_000), 3_000,
@@ -394,8 +491,7 @@ final class TcpOverloadAdmissionTests: XCTestCase {
             flowId: ObjectIdentifier(object), meta: meta(bundleId: bundleId))
         guard case .admit(let token) = decision else {
             XCTFail("expected admission, got \(decision)")
-            return TcpAdmissionToken(
-                flowId: ObjectIdentifier(object), startedAt: .now(), appId: bundleId)
+            preconditionFailure("admission helper called when admission was rejected")
         }
         return token
     }
@@ -414,15 +510,6 @@ final class TcpOverloadAdmissionTests: XCTestCase {
         )
     }
 
-    private func waitFor(
-        _ description: String, timeout: TimeInterval = 2.0, _ condition: () -> Bool
-    ) {
-        let deadline = Date().addingTimeInterval(timeout)
-        while !condition(), Date() < deadline {
-            Thread.sleep(forTimeInterval: 0.002)
-        }
-        XCTAssertTrue(condition(), description)
-    }
 }
 
 private final class CapturedNotices: @unchecked Sendable {

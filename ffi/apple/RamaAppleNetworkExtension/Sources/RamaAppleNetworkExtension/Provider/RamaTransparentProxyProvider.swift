@@ -54,6 +54,7 @@ import RamaAppleNEFFI
 enum FlowLogLevel: Equatable {
     case trace
     case debug
+    case info
     case error
 }
 
@@ -273,11 +274,11 @@ nonisolated(unsafe) var writeRetryHardDeadlineMs: Int = 5_000
 /// Memory budget (in bytes) each writer pump (TCP response and TCP egress)
 /// keeps queued before it tells the Rust bridge to pause.
 ///
-/// Byte-based rather than chunk-count based: a chunk-count cap of N bounds
-/// worst-case memory at `N * max_chunk_size`, which with our 16–64 KiB
-/// chunks blows up fast under h2 multiplexing (many concurrent flows each
-/// holding the full chunk-count budget). A byte budget is constant
-/// regardless of chunk size.
+/// The byte budget is paired with `tcpWritePumpMaxPendingItems`. Bytes bound
+/// payload storage while the item cap bounds `Data`, queue-entry, and dispatch
+/// metadata when a producer emits pathologically small writes. Neither bound
+/// replaces the other: a byte-only budget could retain one item per byte, and
+/// a count-only budget would retain `N * max_chunk_size` payload bytes.
 ///
 /// Default 256 KiB, two pumps per flow = 512 KiB worst-case per flow on
 /// the write side. Smaller than it sounds: any actively backpressured flow
@@ -289,12 +290,22 @@ nonisolated(unsafe) var writeRetryHardDeadlineMs: Int = 5_000
 /// (many concurrent flows, modest per-flow throughput).
 nonisolated(unsafe) var writePumpMaxPendingBytes: Int = 256 * 1024
 
+/// Total non-empty chunks accepted by one TCP write pump, including queued,
+/// dispatch-pending, in-flight, and transient-retry work. The normal 4–16 KiB
+/// transport chunks reach the default byte cap after only 16–64 entries, so
+/// this second bound is inactive on the ordinary path while preventing tiny
+/// writes from manufacturing hundreds of thousands of retained objects.
+let tcpWritePumpMaxPendingItems: Int = 256
+
 /// Drop-on-full bound for `UdpClientWritePump.pending`. UDP is lossy by
 /// definition, so the pump prefers dropping the newest datagram on
 /// overflow over indefinite buffering. Picked to absorb a brief stall
 /// (e.g. waiting for the first client read so `sentByEndpoint` is
 /// known) without blowing up under a misbehaving producer.
 let udpWritePumpMaxPending: Int = 256
+/// Total payload bytes retained by one UDP kernel-write pump, including the
+/// in-flight datagram. Count and byte bounds are both enforced.
+let udpWritePumpMaxRetainedBytes: Int = 256 * 1024
 
 // ── High-water telemetry thresholds ──────────────────────────────────────────
 
@@ -309,28 +320,25 @@ nonisolated(unsafe) var writePumpHwmLogThresholdBytes: Int = writePumpMaxPending
 /// log — same 50 % heuristic as the TCP byte threshold.
 let udpWritePumpHwmLogThreshold: Int = udpWritePumpMaxPending / 2
 
-/// Default wall-clock cap on how long the egress NWConnection lingers
-/// after the local side has sent its FIN before Swift force-cancels
-/// it. Applied when `RamaTcpEgressConnectOptions.has_linger_close_ms`
+/// Default wall-clock grace after a promoted flow reaches terminal before
+/// Swift force-cancels its egress NWConnection. Applied when
+/// `RamaTcpEgressConnectOptions.has_linger_close_ms`
 /// is `false`; an explicit Rust-side `NwTcpConnectOptions.linger_close_timeout`
-/// overrides. 5 seconds is generous enough for any healthy peer to
-/// FIN-ACK and short enough that 200 slow-closing flows cap at a few
-/// hundred concurrent FIN_WAIT_1 sockets rather than accumulating.
+/// overrides. A successful local FIN does not start this grace because the
+/// opposite response half may remain quiet and legally resume later.
 ///
 /// `var` for tests that need a short linger to keep ARC-leak-check
 /// runtime bounded — same pattern as `defaultEgressWaitingToleranceMs`.
-/// The linger watchdog holds `connection` strongly until it fires;
+/// The terminal linger watchdog holds `connection` strongly until it fires;
 /// tests that assert `weakConn == nil` after teardown need to clamp
 /// this so the watchdog releases before the polling deadline.
 nonisolated(unsafe) var defaultLingerCloseMs: UInt32 = 5_000
 
-/// Default grace window between the egress read pump observing peer
-/// EOF / read error and the backstop `connection.cancel()` firing.
-/// Applied when `RamaTcpEgressConnectOptions.has_egress_eof_grace_ms`
-/// is `false`. 2 seconds is enough headroom for the clean teardown
-/// path (`on_server_closed` → `closeWhenDrained` → cancel) to
-/// complete on the common case, while still bounding cleanup when
-/// the originating app has stopped reading.
+/// Default grace window after an abnormal egress-read stop. Applied when
+/// `RamaTcpEgressConnectOptions.has_egress_eof_grace_ms` is `false`.
+/// It bounds cleanup after a read error, a vanished Swift session, or Rust
+/// dropping its egress consumer. Clean server→client EOF deliberately does
+/// not arm it because a still-active upload may remain quiet and resume.
 let defaultEgressEofGraceMs: UInt32 = 2_000
 
 /// Default tolerance window for a post-ready `NWConnection` sitting
@@ -405,10 +413,9 @@ nonisolated(unsafe) var defaultEgressPreReadyWaitingBudgetMs: UInt32 = 3_000
 /// observes errors / EOF on explicit close). Without a watchdog, a
 /// flow that completes a few request/response datagrams and then
 /// goes quiet (DNS, mDNS probes, NAT-binding pings, …) stays
-/// registered in `TransparentProxyCore.udpSessions` until the
-/// engine-side `udp_max_flow_lifetime` cap fires — 15 min by
-/// default, which is long enough to accumulate thousands of
-/// pinned sessions under normal device traffic.
+/// registered in `TransparentProxyCore.udpSessions` indefinitely. Rust's
+/// independent `udp_max_flow_lifetime` defaults to `None` so active QUIC/H3
+/// flows are not cut off; deployments may opt into an absolute cap.
 ///
 /// 60 s is the smallest window that comfortably exceeds typical
 /// real-world UDP-flow idle gaps (DNS retry cadence, NAT-keepalive
@@ -418,7 +425,7 @@ nonisolated(unsafe) var defaultEgressPreReadyWaitingBudgetMs: UInt32 = 3_000
 ///
 /// `var` for tests that need a short timeout to keep ARC-leak-check
 /// runtime bounded — same pattern as `defaultLingerCloseMs`.
-nonisolated(unsafe) var defaultUdpIdleTimeoutMs: UInt32 = 60_000
+nonisolated(unsafe) var defaultUdpIdleTimeoutMs: UInt64 = 60_000
 
 /// Idle (no-progress) reaper deadline for promoted-path TCP flows
 /// (`TcpDirectForwarder`), in milliseconds. `0` disables the reaper.
@@ -462,7 +469,7 @@ nonisolated(unsafe) var defaultPromotedIdleTimeoutMs: UInt32 = 900_000
 //     BOTH TCP and UDP admission (a UDP burst can approach the ceiling too).
 //   * This reaper never refuses or delays a new flow: the new flow is admitted;
 //     the reap (async, off the delivery thread) frees room for SUBSEQUENT flows.
-//     A burst of triggers is coalesced (`pressureReapScheduled`) into one scan,
+//     A burst of triggers is coalesced (`pressureReapSlot`) into one scan,
 //     victims still tearing down stay excluded and count as gone (so triggers
 //     in that window select nothing twice), and after a scan finds nothing
 //     idle past the floor, rescans are skipped until the closest flow could
@@ -477,7 +484,7 @@ nonisolated(unsafe) var defaultPromotedIdleTimeoutMs: UInt32 = 900_000
 //     episode) rather than reset a live connection — the SoftCap margin below
 //     the ceiling is the cushion for that (rare) case.
 //   * Mode-agnostic eviction: BOTH `viaRust` and `.promoted` flows are evictable
-//     (both bump `lastActivityAt` on the shared write-pump flowQueue hop, so the
+//     (both bump `lastActivityAt` from their read and write pumps, so the
 //     idle-floor check excludes an actively-transferring flow of either mode).
 //     Eviction is TCP-only: UDP flows self-bound via `defaultUdpIdleTimeoutMs`
 //     (60s, far tighter than TCP), so a UDP-driven burst TRIGGERS the reap
@@ -486,15 +493,77 @@ nonisolated(unsafe) var defaultPromotedIdleTimeoutMs: UInt32 = 900_000
 //     and the promoted maintenance reaper remain the slower per-mode hygiene
 //     backstops; this is the fast, global one.)
 //
-// IMPORTANT — these defaults are UNVALIDATED guesses. The kernel ceiling is
-// undocumented (~600 live flows observed at the failure edge); `…SoftCap` sits
-// below that with margin. They MUST be calibrated against an on-device
-// burst/soak run (see scripts/soak_test.sh + the burst regression test) before
-// being trusted. `…SoftCap == 0` disables the backstop. `var` for test tuning,
-// same pattern as the other `default…Ms` knobs above.
-nonisolated(unsafe) var defaultFlowPressureSoftCap: UInt32 = 450
-nonisolated(unsafe) var defaultFlowPressureLowWater: UInt32 = 350
-nonisolated(unsafe) var defaultFlowPressureIdleFloorMs: UInt32 = 120_000
+// The kernel ceiling is undocumented (~600 live flows observed). Calibrate
+// these margins with on-device burst and soak workloads. A zero soft cap
+// disables the soft backstop. Startup publishes the controls under one lock;
+// the byte and datagram paths do not read them.
+private struct FlowPressureDefaults {
+    var softCap: UInt32 = 450
+    var lowWater: UInt32 = 350
+    var idleFloorMs: UInt32 = 120_000
+    var hardCap: UInt32 = 500
+}
+
+private let flowPressureDefaults = Locked(FlowPressureDefaults())
+
+var defaultFlowPressureSoftCap: UInt32 {
+    get { flowPressureDefaults.withLock { $0.softCap } }
+    set { flowPressureDefaults.withLock { $0.softCap = newValue } }
+}
+
+var defaultFlowPressureLowWater: UInt32 {
+    get { flowPressureDefaults.withLock { $0.lowWater } }
+    set { flowPressureDefaults.withLock { $0.lowWater = newValue } }
+}
+
+var defaultFlowPressureIdleFloorMs: UInt32 {
+    get { flowPressureDefaults.withLock { $0.idleFloorMs } }
+    set { flowPressureDefaults.withLock { $0.idleFloorMs = newValue } }
+}
+
+var defaultLiveFlowHardCap: UInt32 {
+    get { flowPressureDefaults.withLock { $0.hardCap } }
+    set { flowPressureDefaults.withLock { $0.hardCap = newValue } }
+}
+
+private func setFlowPressureDefaults(
+    softCap: UInt32, lowWater: UInt32, idleFloorMs: UInt32,
+    hardCap: UInt32
+) {
+    flowPressureDefaults.withLock { defaults in
+        defaults.softCap = softCap
+        defaults.lowWater = lowWater
+        defaults.idleFloorMs = idleFloorMs
+        defaults.hardCap = hardCap
+    }
+}
+
+/// Keep an enabled pressure-reaper trigger at or below an enabled admission
+/// ceiling. Otherwise a hard-cap refusal can wake the reaper while registered
+/// occupancy is still below its trigger, making the wake an unconditional
+/// no-op. Zero retains its documented meaning on either side: a zero soft cap
+/// disables reaping, while a zero hard cap leaves admission unbounded.
+func normalizedFlowPressureSoftCap(softCap: UInt32, hardCap: UInt32) -> UInt32 {
+    guard softCap > 0, hardCap > 0 else { return softCap }
+    return min(softCap, hardCap)
+}
+
+/// Keep the latency/timeout pressure threshold reachable below an enabled
+/// in-flight admission ceiling. Zero preserves its documented disable meaning
+/// for either threshold.
+func normalizedTcpStartSoftCap(softCap: UInt32, hardCap: UInt32) -> UInt32 {
+    guard softCap > 0, hardCap > 0 else { return softCap }
+    return min(softCap, hardCap)
+}
+
+/// Keep an enabled reaper's target strictly below its trigger. This guarantees
+/// at least one slot of hysteresis; deployments that want a larger batch gap
+/// configure a lower target. A cap of one has the sole meaningful target zero.
+/// A zero soft cap disables pressure reaping, so its unused target is preserved.
+func normalizedFlowPressureLowWater(softCap: UInt32, lowWater: UInt32) -> UInt32 {
+    guard softCap > 0 else { return lowWater }
+    return min(lowWater, softCap - 1)
+}
 
 /// Hard cap on egress `NWConnection.start` calls that have not reached
 /// `.ready` yet. This is the admission-side circuit breaker: every pre-ready
@@ -813,27 +882,32 @@ struct TcpWriterState {
     /// Sum of bytes currently queued OR in-flight on the writer.
     /// Source of truth for backpressure decisions.
     var pendingBytes: Int = 0
+    /// Number of accepted non-empty chunks currently dispatch-pending, queued,
+    /// in-flight, or retained for transient retry. Charged over the same
+    /// lifetime as `pendingBytes` so the asynchronous handoff itself is bounded.
+    var pendingItems: Int = 0
+    /// Exact byte count whose TCP retry is parked behind the process-wide
+    /// writer envelope. A precharged grant must only satisfy this same retry.
+    var aggregateWaitExpectedBytes: Int?
+    var aggregateWaiter: WriterMemoryWaiter?
+    var aggregateGrant: WriterMemoryGrant?
     /// Set when an `enqueue` returned `.paused`. We fire `onDrained`
-    /// on the first removal that drops `pendingBytes` below the cap,
-    /// then clear — edge-triggered so we never spam Rust with
-    /// redundant drain signals while the queue churns at-cap.
+    /// on the first removal that leaves headroom under both caps, then clear —
+    /// edge-triggered so we never spam Rust with redundant drain signals while
+    /// the queue churns at either cap.
     var pausedSignaled: Bool = false
-    /// All-time peak of `pendingBytes` for this pump instance.  Updated
-    /// atomically under the lock so the high-water telemetry log fires
-    /// exactly once per new peak above `writePumpHwmLogThresholdBytes`.
+    /// All-time peak of `pendingBytes` for this pump instance. Updated
+    /// atomically under the lock; telemetry logs only its first threshold
+    /// crossing so a byte-at-a-time producer cannot amplify logging.
     var pendingBytesHwm: Int = 0
 }
 
-/// Delegates lifecycle callbacks from `TcpWritePumpCore` to its owner.
-/// All calls are made on `core.queue`, never on a Tokio or FFI thread.
+/// Sendable wrapper for Apple's provider-start completion while it is
+/// captured by the settings callback.
 ///
-/// **Re-entrancy constraint:** implementations MUST NOT call back into
-/// `core` or acquire `core.state` from within either method.
-/// `Locked<T>` wraps a non-reentrant `NSLock`; a nested `withLock` on
-/// the same instance deadlocks deterministically.  Both methods are
-/// invoked after the lock has been released, so there is no active lock
-/// to re-enter — but future implementors should not assume otherwise.
-
+/// Invocation is deliberately unsynchronised: the caller must leave all
+/// lifecycle locks and group leases before entering this external callback,
+/// which is allowed to synchronously re-enter provider teardown.
 private final class ProviderStartCompletion: @unchecked Sendable {
     private let body: (Error?) -> Void
 
@@ -909,17 +983,12 @@ public final class RamaTransparentProxyProvider: NETransparentProxyProvider {
             )
             return
         }
-        core.attachEngine(engine)
-        core.logLifecycle("engine created")
-
         guard let startup = engine.config() else {
             core.logLifecycleError("failed to get transparent proxy config from rust")
-            // Apple does NOT call `stopProxy` to clean up after a failed
-            // `startProxy`, so any state we attached above must be torn
-            // down locally before we surface the error — otherwise the
-            // engine and the 60s flow-count telemetry timer leak until
-            // the next provider lifecycle.
-            core.detachEngine(reason: 0)
+            // The core is deliberately not attached until configuration is
+            // installed. Stop this locally-owned engine because Apple does
+            // not compensate a failed `startProxy` with `stopProxy`.
+            engine.stop(reason: 0)
             let error = NSError(
                 domain: "RamaTransparentProxy.Startup",
                 code: 2,
@@ -938,9 +1007,13 @@ public final class RamaTransparentProxyProvider: NETransparentProxyProvider {
             return
         }
 
-        Self.applyRuntimeConfig(from: startup) { [core] msg in
+        let runtimePolicy = Self.makeRuntimePolicy(from: startup) { [core] msg in
             core.logLifecycle(msg)
         }
+        // Publish the engine and its fully-built policy in one core transaction.
+        // No maintenance task or flow callback can observe a partial config.
+        let engineGeneration = core.attachEngine(engine, runtimePolicy: runtimePolicy)
+        core.logLifecycle("engine created")
 
         let settings = Self.buildNetworkSettings(
             from: startup,
@@ -951,17 +1024,47 @@ public final class RamaTransparentProxyProvider: NETransparentProxyProvider {
         let completion = ProviderStartCompletion(completionHandler)
         setTunnelNetworkSettings(settings) { [core, completion] error in
             if let error {
-                core.logLifecycleError("setTunnelNetworkSettings error: \(error)")
-                // Same reason as the `engine.config()` failure path:
-                // Apple won't compensate via `stopProxy`, so we must
-                // tear down the engine + telemetry timer locally.
-                core.detachEngine(reason: 0)
-                completion(error)
+                if core.detachEngine(ifGeneration: engineGeneration, reason: 0) {
+                    core.logLifecycleError("setTunnelNetworkSettings error: \(error)")
+                    // Apple won't compensate via `stopProxy`, so the current
+                    // failed start must tear down its own engine locally.
+                    completion(error)
+                } else {
+                    completion(Self.supersededStartError())
+                }
                 return
             }
-            core.logLifecycle("setTunnelNetworkSettings ok")
-            completion(nil)
+            Self.completeStartAfterSettingsSuccess(
+                core: core,
+                engineGeneration: engineGeneration
+            ) { error in
+                completion(error)
+            }
         }
+    }
+
+    /// Linearise a successful settings callback against engine replacement,
+    /// then notify Apple only after the lifecycle-group lease has been left.
+    /// The external completion may synchronously call back into `stopProxy`.
+    internal static func completeStartAfterSettingsSuccess(
+        core: TransparentProxyCore,
+        engineGeneration: UInt64,
+        completion: (Error?) -> Void
+    ) {
+        let completed = core.withActiveEngineGeneration(engineGeneration) {
+            core.logLifecycle("setTunnelNetworkSettings ok")
+        }
+        completion(completed ? nil : supersededStartError())
+    }
+
+    private static func supersededStartError() -> NSError {
+        NSError(
+            domain: "RamaTransparentProxy.Startup",
+            code: 3,
+            userInfo: [
+                NSLocalizedDescriptionKey:
+                    "transparent proxy start was stopped or superseded before settings completed"
+            ])
     }
 
     public override func stopProxy(
@@ -1067,11 +1170,13 @@ public final class RamaTransparentProxyProvider: NETransparentProxyProvider {
         logDebug: (_ publicMessage: String, _ privateMetadata: String) -> Void
     ) -> Bool {
         let callbackReturn = decision.callbackReturnValue
-        // Source app in the clear, like the TCP shed lines and the tick's
-        // `topApps=`; the destination stays private.
+        // Callback/decision/callback-return are stable public counters and
+        // routing evidence. Source-app identity and destination are flow
+        // metadata and must remain private.
         logDebug(
-            "udp_callback=\(callback.rawValue) rama_decision=\(decision.rawValue) callback_return=\(callbackReturn) source_app=\(sourceAppSigningIdentifier ?? "<missing>")",
-            "initial_remote=\(remoteEndpoint?.description ?? "<unsupported-or-missing>")"
+            "udp_callback=\(callback.rawValue) rama_decision=\(decision.rawValue) callback_return=\(callbackReturn)",
+            "source_app=\(sourceAppSigningIdentifier ?? "<missing>") "
+                + "initial_remote=\(remoteEndpoint?.description ?? "<unsupported-or-missing>")"
         )
         return callbackReturn
     }
@@ -1129,39 +1234,84 @@ public final class RamaTransparentProxyProvider: NETransparentProxyProvider {
         return settings
     }
 
-    /// Apply engine-provided runtime knobs that live outside Apple's
-    /// `NETransparentProxyNetworkSettings`.
+    /// Build the immutable engine-generation policy for runtime knobs that live
+    /// outside Apple's `NETransparentProxyNetworkSettings`.
     ///
-    /// Rust's `TransparentProxyConfig` is authoritative for these values; the
-    /// Swift globals are fallbacks for tests and startup failure paths only.
+    /// Rust's `TransparentProxyConfig` is authoritative. This function is pure
+    /// apart from logging: a replacement start must not mutate policy observed
+    /// by the still-active or retiring generation before atomic attachment.
+    internal static func makeRuntimePolicy(
+        from startup: RamaTransparentProxyConfigBridge,
+        logLifecycle: (String) -> Void = { _ in }
+    ) -> TransparentProxyRuntimePolicy {
+        let policy = TransparentProxyRuntimePolicy(startup: startup)
+        let flowPressure = policy.flowPressure
+        let tcpStart = policy.tcpStartAdmission
+
+        if flowPressure.softCap != startup.flowPressureSoftCap {
+            logLifecycle(
+                "flow pressure softCap=\(startup.flowPressureSoftCap) exceeds enabled "
+                    + "liveHardCap=\(startup.liveFlowHardCap); using \(flowPressure.softCap)"
+            )
+        }
+        if flowPressure.lowWater != startup.flowPressureLowWater {
+            logLifecycle(
+                "flow pressure lowWater=\(startup.flowPressureLowWater) outside 0..<"
+                    + "\(flowPressure.softCap); using \(flowPressure.lowWater)"
+            )
+        }
+        if tcpStart.softCap != startup.tcpStartInFlightSoftCap {
+            logLifecycle(
+                "tcp start softCap=\(startup.tcpStartInFlightSoftCap) exceeds enabled "
+                    + "hardCap=\(startup.tcpStartInFlightHardCap); using \(tcpStart.softCap)"
+            )
+        }
+        logLifecycle(
+            "tcp write pump cap set to \(policy.tcpWritePump.maxPendingBytes) bytes from engine config")
+        logLifecycle(
+            "flow refusal action=\(policy.flowRefusal == .passthrough ? "passthrough (fail open)" : "block (fail closed)")"
+        )
+        logLifecycle(
+            "tcp overload config hardCap=\(tcpStart.hardCap) softCap=\(tcpStart.softCap) openP95Ms=\(tcpStart.breakerOpenP95Ms) closeP95Ms=\(tcpStart.breakerCloseP95Ms) pressureTimeoutMs=\(tcpStart.pressureConnectTimeoutMs) breakerTimeoutMs=\(tcpStart.breakerConnectTimeoutMs)"
+        )
+        logLifecycle(
+            "flow pressure config softCap=\(flowPressure.softCap) lowWater=\(flowPressure.lowWater) idleFloorMs=\(flowPressure.idleFloorMs) liveHardCap=\(flowPressure.liveHardCap)"
+        )
+        return policy
+    }
+
+    #if DEBUG || RAMA_TESTING
+    /// Compatibility shim for tests that intentionally exercise the legacy
+    /// engine-less defaults. Production startup never calls this mutating
+    /// helper; it builds `makeRuntimePolicy` and publishes the value with the
+    /// engine instead.
+    @discardableResult
     internal static func applyRuntimeConfig(
         from startup: RamaTransparentProxyConfigBridge,
         logLifecycle: (String) -> Void = { _ in }
-    ) {
-        writePumpMaxPendingBytes = startup.tcpWritePumpMaxPendingBytes
-        writePumpHwmLogThresholdBytes = writePumpMaxPendingBytes / 2
-        defaultFlowPressureSoftCap = startup.flowPressureSoftCap
-        defaultFlowPressureLowWater = startup.flowPressureLowWater
-        defaultFlowPressureIdleFloorMs = startup.flowPressureIdleFloorMs
-        defaultTcpStartInFlightHardCap = startup.tcpStartInFlightHardCap
-        defaultTcpStartInFlightSoftCap = startup.tcpStartInFlightSoftCap
-        defaultTcpStartLatencyBreakerP95Ms = startup.tcpStartLatencyBreakerP95Ms
-        defaultTcpStartLatencyBreakerCloseP95Ms = startup.tcpStartLatencyBreakerCloseP95Ms
-        defaultTcpPressureConnectTimeoutMs = startup.tcpPressureConnectTimeoutMs
-        defaultTcpBreakerConnectTimeoutMs = startup.tcpBreakerConnectTimeoutMs
-        defaultFlowRefusalPassthrough = startup.flowRefusalPassthrough
-
-        logLifecycle("tcp write pump cap set to \(writePumpMaxPendingBytes) bytes from engine config")
-        logLifecycle(
-            "flow refusal action=\(defaultFlowRefusalPassthrough ? "passthrough (fail open)" : "block (fail closed)")"
-        )
-        logLifecycle(
-            "tcp overload config hardCap=\(defaultTcpStartInFlightHardCap) softCap=\(defaultTcpStartInFlightSoftCap) openP95Ms=\(defaultTcpStartLatencyBreakerP95Ms) closeP95Ms=\(defaultTcpStartLatencyBreakerCloseP95Ms) pressureTimeoutMs=\(defaultTcpPressureConnectTimeoutMs) breakerTimeoutMs=\(defaultTcpBreakerConnectTimeoutMs)"
-        )
-        logLifecycle(
-            "flow pressure config softCap=\(defaultFlowPressureSoftCap) lowWater=\(defaultFlowPressureLowWater) idleFloorMs=\(defaultFlowPressureIdleFloorMs)"
-        )
+    ) -> TransparentProxyRuntimePolicy {
+        let policy = makeRuntimePolicy(from: startup, logLifecycle: logLifecycle)
+        writePumpMaxPendingBytes = policy.tcpWritePump.maxPendingBytes
+        writePumpHwmLogThresholdBytes = policy.tcpWritePump.hwmLogThresholdBytes
+        setFlowPressureDefaults(
+            softCap: policy.flowPressure.softCap,
+            lowWater: policy.flowPressure.lowWater,
+            idleFloorMs: policy.flowPressure.idleFloorMs,
+            hardCap: policy.flowPressure.liveHardCap)
+        defaultUdpIdleTimeoutMs = policy.udpIdleTimeoutMs
+        defaultTcpStartInFlightHardCap = policy.tcpStartAdmission.hardCap
+        defaultTcpStartInFlightSoftCap = policy.tcpStartAdmission.softCap
+        defaultTcpStartLatencyBreakerP95Ms = policy.tcpStartAdmission.breakerOpenP95Ms
+        defaultTcpStartLatencyBreakerCloseP95Ms =
+            policy.tcpStartAdmission.breakerCloseP95Ms
+        defaultTcpPressureConnectTimeoutMs =
+            policy.tcpStartAdmission.pressureConnectTimeoutMs
+        defaultTcpBreakerConnectTimeoutMs =
+            policy.tcpStartAdmission.breakerConnectTimeoutMs
+        defaultFlowRefusalPassthrough = policy.flowRefusal.isPassthrough
+        return policy
     }
+    #endif
 
     /// Translate one Rust-side rule into one or more
     /// `NENetworkRule`s. Returns an empty array on invalid

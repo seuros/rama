@@ -3070,6 +3070,7 @@ dependencies = [
  "rama",
  "serde",
  "serde_json",
+ "tikv-jemalloc-sys",
  "tikv-jemallocator",
  "tokio",
 ]

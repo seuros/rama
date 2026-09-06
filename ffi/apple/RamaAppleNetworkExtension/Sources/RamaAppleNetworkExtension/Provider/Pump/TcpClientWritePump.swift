@@ -17,7 +17,10 @@ final class TcpClientWritePump: @unchecked Sendable {
         logger: @escaping @Sendable (FlowLogMessage) -> Void,
         onTerminalError: @escaping @Sendable (Error) -> Void,
         onDrained: @escaping @Sendable () -> Void,
-        onActivity: @escaping @Sendable () -> Void = {}
+        onActivity: @escaping @Sendable () -> Bool = { true },
+        writerMemoryBudget: WriterMemoryBudget = WriterMemoryBudget(),
+        writePolicy: TcpWritePumpPolicy =
+            TcpWritePumpPolicy(maxPendingBytes: writePumpMaxPendingBytes)
     ) {
         self.logger = logger
         self.onTerminalError = onTerminalError
@@ -29,22 +32,35 @@ final class TcpClientWritePump: @unchecked Sendable {
             logHwm: { hwm in
                 logger(FlowLogMessage(
                     level: .trace,
-                    text: "tcp client write pump pendingBytes hwm=\(hwm) cap=\(writePumpMaxPendingBytes)"
+                    text: "tcp client write pump pendingBytes hwm=\(hwm) cap=\(writePolicy.maxPendingBytes)"
                 ))
             },
-            onActivity: onActivity
+            onActivity: onActivity,
+            writerMemoryBudget: writerMemoryBudget,
+            writePolicy: writePolicy
         )
         self.core = core
         core.delegate = self
     }
 
 
-    func markOpened() {
+    func markOpened(
+        _ completion: @escaping @Sendable () -> Void = {}
+    ) {
+        // Defer even on this queue: completion may enter a lifecycle lease,
+        // which must not nest inside the caller's lease during engine detach.
         core.queue.async { [weak self] in
-            guard let self else { return }
+            guard let self else {
+                completion()
+                return
+            }
+            defer { completion() }
             if self.core.isClosed() { return }
             self.wasEverOpened = true
-            self.core.markOpen()
+            // `closeWhenDrained` may have arrived while flow.open was in
+            // flight. Enter draining before the first write so opening cannot
+            // erase that terminal request.
+            self.core.markOpen(draining: self.onDrainedClose != nil)
         }
     }
 
@@ -59,6 +75,16 @@ final class TcpClientWritePump: @unchecked Sendable {
         core.enqueue(data)
     }
 
+    @discardableResult
+    func enqueuePrecharged(_ payload: TcpPayloadSlice) -> RamaTcpDeliverStatusBridge {
+        core.enqueuePrecharged(payload)
+    }
+
+    var maxPendingBytes: Int { core.writePolicy.maxPendingBytes }
+    var aggregateBudget: WriterMemoryBudget { core.aggregateBudget }
+
+    func retireAdmissionForEngineDetach() { core.retireAdmission() }
+
     func closeWhenDrained(
         _ onDrainedClose: @escaping @Sendable (_ wasOpened: Bool) -> Void
     ) {
@@ -69,6 +95,10 @@ final class TcpClientWritePump: @unchecked Sendable {
                 return
             }
             self.onDrainedClose = onDrainedClose
+            // A successful flow.open owns the transition from a pending drain
+            // to active draining. Completing here would close an unopened flow
+            // cleanly; starting writes here would target an unopened flow.
+            if !self.wasEverOpened { return }
             self.core.beginDraining()
         }
     }
@@ -90,7 +120,7 @@ final class TcpClientWritePump: @unchecked Sendable {
         }
     }
 
-    #if DEBUG
+    #if DEBUG || RAMA_TESTING
         /// Test-only. Schedules a block on the core queue to snapshot
         /// the post-cancel invariants
         ///   `closed ⇒ pending empty ∧ retrying nil ∧ pendingBytes 0`.

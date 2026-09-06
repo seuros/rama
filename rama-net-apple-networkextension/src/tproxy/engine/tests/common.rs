@@ -165,6 +165,10 @@ impl TransparentProxyAsyncRuntimeFactory for TestRuntimeFactory {
         self,
         _cfg: Option<&[u8]>,
     ) -> Result<TransparentProxyAsyncRuntime, Self::Error> {
+        // All engine fixtures must finish installing capture before a worker
+        // can register a close-event callsite, including tests that do not
+        // assert on telemetry themselves.
+        install_close_capture();
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_time()
@@ -174,9 +178,46 @@ impl TransparentProxyAsyncRuntimeFactory for TestRuntimeFactory {
     }
 }
 
+pub(super) fn paused_test_runtime(
+    _cfg: Option<&[u8]>,
+) -> Result<TransparentProxyAsyncRuntime, BoxError> {
+    install_close_capture();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .start_paused(true)
+        .build()?;
+    Ok(TransparentProxyAsyncRuntime::from_tokio(rt))
+}
+
+pub(super) fn stop_paused_engine(engine: TransparentProxyEngine<TestHandler>) {
+    // A current-thread fixture has no background workers to poll the ordinary
+    // blocking stop. Drive its graceful drain before dropping the runtime.
+    engine.udp_ingress_budget.close_flow_releases();
+    let pair = engine.shutdown.lock().take().expect("live test engine");
+    engine.rt.as_ref().unwrap().block_on_borrowed(async {
+        _ = pair.trigger.send(());
+        pair.shutdown
+            .shutdown_with_limit(Duration::from_secs(1))
+            .await
+            .expect("paused engine must drain");
+    });
+    drop(engine);
+}
+
 pub(super) fn build_engine(handler: TestHandler) -> TransparentProxyEngine<TestHandler> {
     TransparentProxyEngineBuilder::new(TestHandlerFactory(handler))
         .with_runtime_factory(TestRuntimeFactory)
+        .build()
+        .expect("build engine")
+}
+
+pub(super) fn build_engine_with_tcp_flow_buffer_size(
+    handler: TestHandler,
+    size: usize,
+) -> TransparentProxyEngine<TestHandler> {
+    TransparentProxyEngineBuilder::new(TestHandlerFactory(handler))
+        .with_runtime_factory(TestRuntimeFactory)
+        .with_tcp_flow_buffer_size(size)
         .build()
         .expect("build engine")
 }
@@ -252,22 +293,23 @@ pub(super) fn build_engine_with_stop_drain_max_wait(
 // ── close-telemetry capture ────────────────────────────────────────────────
 //
 // On `cancel()` the Swift-facing callbacks are suppressed, so the only signal
-// the close epilogue ran is the `"tcp flow closed"` tracing event. A global
+// the close epilogue ran is the TCP/UDP `"flow closed"` tracing event. A global
 // subscriber records each closed `flow_id`; tests filter by a unique id so they
 // hold whether run per-process (nextest) or shared (`cargo test`).
 
 use std::sync::{Once, OnceLock};
 
-static CLOSED_FLOW_IDS: OnceLock<parking_lot::Mutex<Vec<u64>>> = OnceLock::new();
+static CLOSED_FLOWS: OnceLock<parking_lot::Mutex<Vec<(u64, Option<String>)>>> = OnceLock::new();
 static INSTALL_CAPTURE: Once = Once::new();
 
-fn closed_flow_ids() -> &'static parking_lot::Mutex<Vec<u64>> {
-    CLOSED_FLOW_IDS.get_or_init(|| parking_lot::Mutex::new(Vec::new()))
+fn closed_flows() -> &'static parking_lot::Mutex<Vec<(u64, Option<String>)>> {
+    CLOSED_FLOWS.get_or_init(|| parking_lot::Mutex::new(Vec::new()))
 }
 
 #[derive(Default)]
 struct CloseVisitor {
     flow_id: Option<u64>,
+    reason: Option<String>,
     is_close: bool,
 }
 
@@ -278,8 +320,12 @@ impl tracing::field::Visit for CloseVisitor {
         }
     }
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-        if field.name() == "message" && format!("{value:?}").contains("tcp flow closed") {
-            self.is_close = true;
+        if field.name() == "reason" {
+            self.reason = Some(format!("{value:?}").trim_matches('"').to_owned());
+        } else if field.name() == "message" {
+            let message = format!("{value:?}");
+            self.is_close =
+                message.contains("transparent proxy") && message.contains("flow closed");
         }
     }
 }
@@ -301,7 +347,7 @@ impl tracing::Subscriber for CloseCaptureSubscriber {
         if visitor.is_close
             && let Some(id) = visitor.flow_id
         {
-            closed_flow_ids().lock().push(id);
+            closed_flows().lock().push((id, visitor.reason));
         }
     }
     fn enter(&self, _: &tracing::span::Id) {}
@@ -309,16 +355,35 @@ impl tracing::Subscriber for CloseCaptureSubscriber {
 }
 
 /// Install the close-capture subscriber exactly once for the test process.
+///
+/// Runtime fixtures call this before starting workers: a first callsite
+/// registration racing a late global-subscriber install can cache disabled
+/// interest. Waiting only in tests that assert on events is too late when
+/// other tests already have running engines in the same libtest process.
 pub(super) fn install_close_capture() {
     INSTALL_CAPTURE.call_once(|| {
-        // Ignore the error: if some other harness already set a global default we
-        // simply can't capture, and the caller's `flow_was_closed` will stay false
-        // (surfaced as a normal assertion failure rather than a panic here).
-        _ = tracing::subscriber::set_global_default(CloseCaptureSubscriber);
+        tracing::subscriber::set_global_default(CloseCaptureSubscriber)
+            .expect("close-capture subscriber must own the test process global default");
     });
 }
 
-/// Whether a `"tcp flow closed"` telemetry event has been observed for `flow_id`.
+/// Whether a TCP/UDP `"flow closed"` telemetry event has been observed for `flow_id`.
 pub(super) fn flow_was_closed(flow_id: u64) -> bool {
-    closed_flow_ids().lock().contains(&flow_id)
+    closed_flows().lock().iter().any(|(id, _)| *id == flow_id)
+}
+
+pub(super) fn flow_close_count(flow_id: u64) -> usize {
+    closed_flows()
+        .lock()
+        .iter()
+        .filter(|(id, _)| *id == flow_id)
+        .count()
+}
+
+pub(super) fn flow_close_reason(flow_id: u64) -> Option<String> {
+    closed_flows()
+        .lock()
+        .iter()
+        .rev()
+        .find_map(|(id, reason)| (*id == flow_id).then(|| reason.clone()).flatten())
 }

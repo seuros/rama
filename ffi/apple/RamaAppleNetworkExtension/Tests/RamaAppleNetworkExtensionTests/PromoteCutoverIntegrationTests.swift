@@ -65,6 +65,55 @@ final class PromoteCutoverIntegrationTests: XCTestCase {
             sourceAppAuditToken: nil, sourceAppPid: 4242)
     }
 
+    private func requireFlowQueue(
+        _ ctx: TcpFlowContext,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) -> DispatchQueue {
+        guard let flowQueue = ctx.flowQueue else {
+            XCTFail("production context has a flow queue", file: file, line: line)
+            preconditionFailure("missing production flow queue")
+        }
+        return flowQueue
+    }
+
+    @discardableResult
+    private func onFlowQueue<T>(
+        _ ctx: TcpFlowContext,
+        _ body: (DispatchQueue) -> T
+    ) -> T {
+        let flowQueue = requireFlowQueue(ctx)
+        return flowQueue.sync { body(flowQueue) }
+    }
+
+    @discardableResult
+    private func beginPromoteCutover(
+        _ fx: CoreFixture,
+        ctx: TcpFlowContext,
+        flow: MockTcpFlow
+    ) -> DispatchQueue {
+        let flowQueue = requireFlowQueue(ctx)
+        flowQueue.sync {
+            fx.core.beginPromoteCutover(
+                ctx: ctx,
+                flow: flow,
+                flowQueue: flowQueue,
+                flowId: ObjectIdentifier(flow))
+        }
+        return flowQueue
+    }
+
+    private func markRustDone(_ ctx: TcpFlowContext) {
+        let flowQueue = requireFlowQueue(ctx)
+        flowQueue.sync {
+            ctx.directForwarder?.markRustC2SDone()
+            ctx.directForwarder?.markRustS2CDone()
+        }
+        // The mark methods enqueue their state transitions onto the same
+        // queue. This second hop waits until those transitions have run.
+        flowQueue.sync {}
+    }
+
     private func waitFor(
         _ description: String, timeout: TimeInterval = 5.0,
         condition: () -> Bool
@@ -169,19 +218,16 @@ final class PromoteCutoverIntegrationTests: XCTestCase {
         let flow = MockTcpFlow()
         let (_, ctx) = driveToActivePumps(fx, flow: flow)
 
-        XCTAssertEqual(ctx.mode, .viaRust, "initial mode")
-        XCTAssertNil(ctx.directForwarder, "no forwarder before cutover")
+        XCTAssertEqual(onFlowQueue(ctx) { _ in ctx.mode }, .viaRust,
+            "initial mode")
+        XCTAssertNil(onFlowQueue(ctx) { _ in ctx.directForwarder },
+            "no forwarder before cutover")
 
-        let flowId = ObjectIdentifier(flow)
-        let flowQueue = DispatchQueue(label: "test.fwd.queue")
-        fx.core.beginPromoteCutover(
-            ctx: ctx, flow: flow,
-            flowQueue: flowQueue, flowId: flowId)
-        flowQueue.sync {}
+        beginPromoteCutover(fx, ctx: ctx, flow: flow)
 
-        XCTAssertEqual(ctx.mode, .promoted,
+        XCTAssertEqual(onFlowQueue(ctx) { _ in ctx.mode }, .promoted,
             "beginPromoteCutover must flip mode to .promoted")
-        XCTAssertNotNil(ctx.directForwarder,
+        XCTAssertNotNil(onFlowQueue(ctx) { _ in ctx.directForwarder },
             "beginPromoteCutover must instantiate the forwarder")
     }
 
@@ -196,25 +242,17 @@ final class PromoteCutoverIntegrationTests: XCTestCase {
         let (conn, ctx) = driveToActivePumps(fx, flow: flow)
         let completer = startSendCompleter(conn); defer { completer.store(true) }
 
-        let flowId = ObjectIdentifier(flow)
-        let flowQueue = DispatchQueue(label: "test.fwd.idem")
+        beginPromoteCutover(fx, ctx: ctx, flow: flow)
 
-        fx.core.beginPromoteCutover(
-            ctx: ctx, flow: flow,
-            flowQueue: flowQueue, flowId: flowId)
-        flowQueue.sync {}
-
-        let firstForwarder = ctx.directForwarder
+        let firstForwarder = onFlowQueue(ctx) { _ in ctx.directForwarder }
         XCTAssertNotNil(firstForwarder)
 
         // Second invocation must be a no-op.
-        fx.core.beginPromoteCutover(
-            ctx: ctx, flow: flow,
-            flowQueue: flowQueue, flowId: flowId)
-        flowQueue.sync {}
+        beginPromoteCutover(fx, ctx: ctx, flow: flow)
 
         // The same forwarder instance survives — no replacement.
-        XCTAssertTrue(ctx.directForwarder === firstForwarder,
+        XCTAssertTrue(
+            onFlowQueue(ctx) { _ in ctx.directForwarder === firstForwarder },
             "second beginPromoteCutover must not replace the forwarder")
     }
 
@@ -230,18 +268,103 @@ final class PromoteCutoverIntegrationTests: XCTestCase {
 
         // Simulate "connection already gone" — a pre-empted
         // hard-error path raced ahead.
-        ctx.connection = nil
+        onFlowQueue(ctx) { _ in ctx.connection = nil }
 
-        let flowId = ObjectIdentifier(flow)
-        let flowQueue = DispatchQueue(label: "test.fwd.failed")
-        fx.core.beginPromoteCutover(
-            ctx: ctx, flow: flow,
-            flowQueue: flowQueue, flowId: flowId)
-        flowQueue.sync {}
+        beginPromoteCutover(fx, ctx: ctx, flow: flow)
 
-        XCTAssertEqual(ctx.mode, .viaRust,
+        XCTAssertEqual(onFlowQueue(ctx) { _ in ctx.mode }, .viaRust,
             "cutover must NOT advance mode when prerequisites are missing")
-        XCTAssertNil(ctx.directForwarder)
+        XCTAssertNil(onFlowQueue(ctx) { _ in ctx.directForwarder })
+    }
+
+    func testCutoverRejectsFlowWhoseTerminalDrainAlreadyBegan() {
+        let fx = makeFixture(); defer { tearDown(fx) }
+
+        let flow = MockTcpFlow()
+        let (_, ctx) = driveToActivePumps(fx, flow: flow)
+        onFlowQueue(ctx) { _ in
+            ctx.withMaintenanceStateLocked { state in
+                state.terminalSignalled = true
+                state.drainClosePending = true
+            }
+        }
+
+        beginPromoteCutover(fx, ctx: ctx, flow: flow)
+
+        XCTAssertEqual(onFlowQueue(ctx) { _ in ctx.mode }, .viaRust)
+        XCTAssertNil(onFlowQueue(ctx) { _ in ctx.directForwarder })
+    }
+
+    func testCutoverReplaysClientEofObservedBeforePromotion() {
+        let fx = makeFixture(); defer { tearDown(fx) }
+        let flow = MockTcpFlow()
+        let (conn, ctx) = driveToActivePumps(fx, flow: flow)
+        let completer = startSendCompleter(conn); defer { completer.store(true) }
+        let flowQueue = requireFlowQueue(ctx)
+
+        flow.completeReadSynchronously(data: nil, error: nil)
+        flowQueue.sync {}
+        XCTAssertEqual(flow.pendingReadCount, 0)
+        XCTAssertEqual(
+            flow.closeReadCallCount, 0,
+            "observed EOF must not consume the final provider close")
+
+        beginPromoteCutover(fx, ctx: ctx, flow: flow)
+        XCTAssertEqual(onFlowQueue(ctx) { _ in ctx.mode }, .promoted)
+        guard let forwarder = onFlowQueue(ctx, { _ in ctx.directForwarder }) else {
+            return XCTFail("client half-close remains promotable")
+        }
+
+        let serverTail = Data([0xFA, 0x11])
+        _ = conn.completePendingReceive(
+            data: serverTail,
+            isComplete: false,
+            error: nil)
+        markRustDone(ctx)
+
+        waitFor("replayed client EOF finishes c2s") {
+            flowQueue.sync { forwarder.c2sPhase == .finished }
+        }
+        XCTAssertEqual(
+            flow.pendingReadCount,
+            0,
+            "promotion must not read the already-closed client half again")
+        waitFor("server tail remains deliverable after client EOF") {
+            flow.writes.contains(serverTail)
+        }
+        waitFor("promoted server read starts") { conn.pendingReceiveCount > 0 }
+        _ = conn.completePendingReceive(data: nil, isComplete: true, error: nil)
+        flow.completeNextWrite()
+
+        waitFor("both half-closes release the registry") {
+            fx.core.tcpFlowCount == 0
+        }
+        XCTAssertEqual(
+            flow.closeReadCallCount, 1,
+            "final aggregation issues the provider read close exactly once")
+        XCTAssertEqual(flow.closeWriteCallCount, 1)
+    }
+
+    func testClientCarryoverReadErrorTearsDownWithOriginalError() {
+        let fx = makeFixture(); defer { tearDown(fx) }
+
+        let flow = MockTcpFlow()
+        let (_, ctx) = driveToActivePumps(fx, flow: flow)
+        let flowQueue = beginPromoteCutover(fx, ctx: ctx, flow: flow)
+
+        let error = NSError(domain: "test.promote.carryover", code: 73)
+        flow.completeRead(data: nil, error: error)
+        waitFor("carryover error tears down the promoted flow") {
+            flowQueue.sync { ctx.isDone } && fx.core.tcpFlowCount == 0
+        }
+        XCTAssertEqual(
+            (flow.lastCloseReadError as NSError?)?.domain,
+            "test.promote.carryover")
+        XCTAssertEqual((flow.lastCloseReadError as NSError?)?.code, 73)
+        XCTAssertEqual(
+            (flow.lastCloseWriteError as NSError?)?.domain,
+            "test.promote.carryover")
+        XCTAssertEqual((flow.lastCloseWriteError as NSError?)?.code, 73)
     }
 
     // MARK: - Direct-forward post-cutover byte flow
@@ -272,21 +395,14 @@ final class PromoteCutoverIntegrationTests: XCTestCase {
         let (conn, ctx) = driveToActivePumps(fx, flow: flow)
         let completer = startSendCompleter(conn); defer { completer.store(true) }
 
-        let flowId = ObjectIdentifier(flow)
-        let flowQueue = DispatchQueue(label: "test.fwd.c2s")
         let preSends = conn.sentChunks.count
 
-        fx.core.beginPromoteCutover(
-            ctx: ctx, flow: flow,
-            flowQueue: flowQueue, flowId: flowId)
-        flowQueue.sync {}
+        beginPromoteCutover(fx, ctx: ctx, flow: flow)
 
         // Drain the old in-flight reads (carryover route).
         let (carryC2S, _) = drainOldReadPumpsWithCarryoverBytes(flow, conn)
 
-        ctx.directForwarder?.markRustC2SDone()
-        ctx.directForwarder?.markRustS2CDone()
-        flowQueue.sync {}
+        markRustDone(ctx)
 
         // Wait for the forwarder to issue its OWN flow.readData.
         waitFor("forwarder issued direct flow.readData") {
@@ -322,20 +438,13 @@ final class PromoteCutoverIntegrationTests: XCTestCase {
         let (conn, ctx) = driveToActivePumps(fx, flow: flow)
         let completer = startSendCompleter(conn); defer { completer.store(true) }
 
-        let flowId = ObjectIdentifier(flow)
-        let flowQueue = DispatchQueue(label: "test.fwd.s2c")
         let preWrites = flow.writes.count
 
-        fx.core.beginPromoteCutover(
-            ctx: ctx, flow: flow,
-            flowQueue: flowQueue, flowId: flowId)
-        flowQueue.sync {}
+        beginPromoteCutover(fx, ctx: ctx, flow: flow)
 
         let (_, carryS2C) = drainOldReadPumpsWithCarryoverBytes(flow, conn)
 
-        ctx.directForwarder?.markRustC2SDone()
-        ctx.directForwarder?.markRustS2CDone()
-        flowQueue.sync {}
+        markRustDone(ctx)
 
         waitFor("forwarder issued direct connection.receive") {
             conn.pendingReceiveCount > 0
@@ -367,20 +476,13 @@ final class PromoteCutoverIntegrationTests: XCTestCase {
         let (conn, ctx) = driveToActivePumps(fx, flow: flow)
         let completer = startSendCompleter(conn); defer { completer.store(true) }
 
-        let flowId = ObjectIdentifier(flow)
-        let flowQueue = DispatchQueue(label: "test.fwd.both")
         let preSends = conn.sentChunks.count
         let preWrites = flow.writes.count
 
-        fx.core.beginPromoteCutover(
-            ctx: ctx, flow: flow,
-            flowQueue: flowQueue, flowId: flowId)
-        flowQueue.sync {}
+        beginPromoteCutover(fx, ctx: ctx, flow: flow)
 
         _ = drainOldReadPumpsWithCarryoverBytes(flow, conn)
-        ctx.directForwarder?.markRustC2SDone()
-        ctx.directForwarder?.markRustS2CDone()
-        flowQueue.sync {}
+        markRustDone(ctx)
 
         waitFor("both direct loops active") {
             flow.pendingReadCount > 0 && conn.pendingReceiveCount > 0
@@ -413,21 +515,14 @@ final class PromoteCutoverIntegrationTests: XCTestCase {
         let (conn, ctx) = driveToActivePumps(fx, flow: flow)
         let completer = startSendCompleter(conn); defer { completer.store(true) }
 
-        let flowId = ObjectIdentifier(flow)
-        let flowQueue = DispatchQueue(label: "test.fwd.many")
         let preSends = conn.sentChunks.count
         let preWrites = flow.writes.count
 
-        fx.core.beginPromoteCutover(
-            ctx: ctx, flow: flow,
-            flowQueue: flowQueue, flowId: flowId)
-        flowQueue.sync {}
+        beginPromoteCutover(fx, ctx: ctx, flow: flow)
 
         let (carryC2S, carryS2C) =
             drainOldReadPumpsWithCarryoverBytes(flow, conn)
-        ctx.directForwarder?.markRustC2SDone()
-        ctx.directForwarder?.markRustS2CDone()
-        flowQueue.sync {}
+        markRustDone(ctx)
 
         // Deliver C→S chunks sequentially. The forwarder issues
         // a fresh readData after each delivery; we wait for the
@@ -490,27 +585,20 @@ final class PromoteCutoverIntegrationTests: XCTestCase {
         let (conn, ctx) = driveToActivePumps(fx, flow: flow)
         let completer = startSendCompleter(conn); defer { completer.store(true) }
 
-        let flowId = ObjectIdentifier(flow)
-        let flowQueue = DispatchQueue(label: "test.fwd.eof")
-        fx.core.beginPromoteCutover(
-            ctx: ctx, flow: flow,
-            flowQueue: flowQueue, flowId: flowId)
-        flowQueue.sync {}
+        let flowQueue = beginPromoteCutover(fx, ctx: ctx, flow: flow)
 
         // EOF the in-flight reads (carryover .none on both
         // sides). Drain barriers fire, but `*EofBuffered`
         // flips true, so the directions fast-path to
         // `.finished` once Rust-done lands.
         drainOldReadPumpsWithEof(flow, conn)
-        ctx.directForwarder?.markRustC2SDone()
-        ctx.directForwarder?.markRustS2CDone()
-        flowQueue.sync {}
+        markRustDone(ctx)
 
         waitFor("c2s finished") {
-            ctx.directForwarder?.c2sPhase == .finished
+            flowQueue.sync { ctx.directForwarder?.c2sPhase == .finished }
         }
         waitFor("s2c finished") {
-            ctx.directForwarder?.s2cPhase == .finished
+            flowQueue.sync { ctx.directForwarder?.s2cPhase == .finished }
         }
 
         // Forwarder's onTerminal removes the flow from registry
@@ -518,9 +606,9 @@ final class PromoteCutoverIntegrationTests: XCTestCase {
         waitFor("flow removed from registry", timeout: 5.0) {
             fx.core.tcpFlowCount == 0
         }
-        XCTAssertGreaterThanOrEqual(flow.closeReadCallCount, 1,
+        XCTAssertEqual(flow.closeReadCallCount, 1,
             "forwarder onTerminal must close the kernel flow read side")
-        XCTAssertGreaterThanOrEqual(flow.closeWriteCallCount, 1,
+        XCTAssertEqual(flow.closeWriteCallCount, 1,
             "forwarder onTerminal must close the kernel flow write side")
     }
 
@@ -550,28 +638,22 @@ final class PromoteCutoverIntegrationTests: XCTestCase {
         XCTAssertEqual(conn.pendingReceiveCount, 1,
             "active egress read pump issued exactly one in-flight receive")
 
-        let flowId = ObjectIdentifier(flow)
-        let flowQueue = DispatchQueue(label: "test.fwd.barrier")
-
-        fx.core.beginPromoteCutover(
-            ctx: ctx, flow: flow,
-            flowQueue: flowQueue, flowId: flowId)
-        flowQueue.sync {}
+        let flowQueue = beginPromoteCutover(fx, ctx: ctx, flow: flow)
 
         // Mark Rust done while the in-flight reads are STILL
         // pending. The forwarder transitions to `.active` per
         // direction but the barrier blocks the new readData /
         // receive.
-        ctx.directForwarder?.markRustC2SDone()
-        ctx.directForwarder?.markRustS2CDone()
-        flowQueue.sync {}
+        markRustDone(ctx)
 
         XCTAssertEqual(flow.pendingReadCount, 1,
             "barrier MUST suppress new flow.readData until the old in-flight read drains")
         XCTAssertEqual(conn.pendingReceiveCount, 1,
             "barrier MUST suppress new connection.receive until the old in-flight receive drains")
-        XCTAssertEqual(ctx.directForwarder?.c2sPhase, .active)
-        XCTAssertEqual(ctx.directForwarder?.s2cPhase, .active)
+        XCTAssertEqual(
+            flowQueue.sync { ctx.directForwarder?.c2sPhase }, .active)
+        XCTAssertEqual(
+            flowQueue.sync { ctx.directForwarder?.s2cPhase }, .active)
 
         // Drain the old in-flight reads (carryover route) →
         // markClient/EgressReadDrained fires → forwarder now
@@ -602,18 +684,13 @@ final class PromoteCutoverIntegrationTests: XCTestCase {
         let (conn, ctx) = driveToActivePumps(fx, flow: flow)
         let completer = startSendCompleter(conn); defer { completer.store(true) }
 
-        let flowQueue = DispatchQueue(label: "test.fwd.halfclose")
-        fx.core.beginPromoteCutover(
-            ctx: ctx, flow: flow, flowQueue: flowQueue, flowId: ObjectIdentifier(flow))
-        flowQueue.sync {}
+        let flowQueue = beginPromoteCutover(fx, ctx: ctx, flow: flow)
 
         // Half-close: client read EOFs (C→S finishes) while the egress receive
         // returns DATA (S→C stays active — server still streaming).
         flow.completeRead(data: nil, error: nil)
         _ = conn.completePendingReceive(data: Data([0x01, 0x02]), isComplete: false, error: nil)
-        ctx.directForwarder?.markRustC2SDone()
-        ctx.directForwarder?.markRustS2CDone()
-        flowQueue.sync {}
+        markRustDone(ctx)
 
         waitFor("C→S drained to .finished") {
             flowQueue.sync { ctx.directForwarder?.c2sPhase == .finished }
@@ -640,7 +717,7 @@ final class PromoteCutoverIntegrationTests: XCTestCase {
         flowQueue.sync {}
 
         XCTAssertFalse(
-            ctx.isDone,
+            flowQueue.sync { ctx.isDone },
             "a live half-close with an active opposite direction must NOT be force-torn-down")
         XCTAssertEqual(fx.core.tcpFlowCount, 1, "flow must remain registered")
     }
@@ -659,16 +736,16 @@ final class PromoteCutoverIntegrationTests: XCTestCase {
         let completer = startSendCompleter(conn); defer { completer.store(true) }
 
         // Make the pre-cutover activity look ancient.
-        ctx.lastActivityAt = DispatchTime(uptimeNanoseconds: 1)
-        let before = ctx.lastActivityAt.uptimeNanoseconds
+        let before = onFlowQueue(ctx) { _ -> UInt64 in
+            ctx.lastActivityAt = DispatchTime(uptimeNanoseconds: 1)
+            return ctx.lastActivityAt.uptimeNanoseconds
+        }
 
-        let flowQueue = DispatchQueue(label: "test.fwd.idlereset")
-        fx.core.beginPromoteCutover(
-            ctx: ctx, flow: flow, flowQueue: flowQueue, flowId: ObjectIdentifier(flow))
-        flowQueue.sync {}
+        beginPromoteCutover(fx, ctx: ctx, flow: flow)
 
         XCTAssertGreaterThan(
-            ctx.lastActivityAt.uptimeNanoseconds, before,
+            onFlowQueue(ctx) { _ in ctx.lastActivityAt.uptimeNanoseconds },
+            before,
             "cutover must reset the promoted-idle clock to ~now, giving a fresh full timeout")
     }
 }

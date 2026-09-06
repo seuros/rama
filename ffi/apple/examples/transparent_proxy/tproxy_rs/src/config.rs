@@ -1,4 +1,4 @@
-use rama::error::{BoxError, ErrorContext as _};
+use rama::error::{BoxError, BoxErrorExt as _, ErrorContext as _};
 use rama::net::address::HostWithPort;
 use serde::Deserialize;
 
@@ -19,6 +19,9 @@ pub struct DemoProxyConfig {
     // Egress connect timeout (ms); applied via `egress_tcp_connect_options`.
     // `None`/`0` keeps the platform default.
     pub tcp_connect_timeout_ms: Option<u64>,
+    /// Optional Rust->Swift writer-pump cap exported in the startup config.
+    /// Absent keeps the engine's 256 KiB production default.
+    pub tcp_write_pump_max_pending_bytes: Option<usize>,
     // Egress TCP_NODELAY. The engine already defaults this ON (the relay
     // is the only Nagle decision-maker in the path); this knob exists to
     // opt back into Nagle for experiments.
@@ -33,6 +36,17 @@ pub struct DemoProxyConfig {
     /// Makes the UDP overrides temporary and enables allowlisted public
     /// diagnostics for the signed live E2E. Never persisted by the example app.
     pub udp_e2e_mode: bool,
+    /// Canonical run UUID attached to every signed-E2E decision diagnostic.
+    /// Launch-only and non-secret; absent for ordinary provider starts.
+    pub evidence_run_uuid: Option<String>,
+    /// Exact remote endpoints eligible for the signed-E2E decision diagnostic.
+    /// This prevents unrelated traffic from an allowlisted system tool from
+    /// entering the evidence window.
+    pub udp_e2e_diagnostic_endpoints: Vec<HostWithPort>,
+    /// Optional global-pressure probe lease override. The engine default is
+    /// 10 ms; larger values are useful for observability and loaded-system
+    /// integration tests without changing the coordinator's semantics.
+    pub udp_ingress_probe_lease_ms: Option<u64>,
     // Optional inline PEM overrides — if both are set they bypass the System Keychain.
     // Intended for environments (e.g. e2e test runners) that lack keychain access.
     // The production app leaves these unset and always uses the System Keychain.
@@ -58,6 +72,7 @@ impl Default for DemoProxyConfig {
             html_badge_label: "proxied by rama".to_owned(),
             peek_duration_s: 8.,
             tcp_connect_timeout_ms: None,
+            tcp_write_pump_max_pending_bytes: None,
             tcp_no_delay: true,
             // Keep in sync with `policy::DomainExclusionList::default()`
             // — that's the engine-internal fallback; this is the
@@ -100,6 +115,9 @@ impl Default for DemoProxyConfig {
             udp_passthrough_ports: Vec::new(),
             udp_blocked_endpoints: Vec::new(),
             udp_e2e_mode: false,
+            evidence_run_uuid: None,
+            udp_e2e_diagnostic_endpoints: Vec::new(),
+            udp_ingress_probe_lease_ms: None,
             ca_cert_pem: None,
             ca_key_pem: None,
             xpc_service_name: None,
@@ -111,12 +129,68 @@ impl Default for DemoProxyConfig {
 impl DemoProxyConfig {
     pub fn from_opaque_config(opaque_config: Option<&[u8]>) -> Result<Self, BoxError> {
         match opaque_config {
-            Some(bytes) if !bytes.is_empty() => {
-                serde_json::from_slice(bytes).context("decode transparent proxy engine config JSON")
-            }
+            Some(bytes) if !bytes.is_empty() => serde_json::from_slice(bytes)
+                .context("decode transparent proxy engine config JSON")
+                .and_then(Self::validate),
             _ => Ok(Self::default()),
         }
     }
+
+    fn validate(config: Self) -> Result<Self, BoxError> {
+        if config.udp_e2e_mode && !cfg!(any(test, feature = "e2e")) {
+            return Err(BoxError::from_static_str(
+                "udp_e2e_mode requires the e2e build feature",
+            ));
+        }
+        let has_evidence_identity =
+            config.evidence_run_uuid.is_some() || !config.udp_e2e_diagnostic_endpoints.is_empty();
+        if !config.udp_e2e_mode && has_evidence_identity {
+            return Err(BoxError::from_static_str(
+                "launch-only evidence fields require udp_e2e_mode",
+            ));
+        }
+        let evidence_identity_valid = config
+            .evidence_run_uuid
+            .as_deref()
+            .is_some_and(is_canonical_uuid)
+            && !config.udp_e2e_diagnostic_endpoints.is_empty()
+            && config.udp_e2e_diagnostic_endpoints.len() <= 512;
+        if config.udp_e2e_mode && !evidence_identity_valid {
+            return Err(BoxError::from_static_str(
+                "udp_e2e_mode requires one canonical evidence_run_uuid and 1..=512 diagnostic endpoints; launch-only evidence fields require udp_e2e_mode",
+            ));
+        }
+        if config
+            .udp_e2e_diagnostic_endpoints
+            .iter()
+            .map(ToString::to_string)
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+            != config.udp_e2e_diagnostic_endpoints.len()
+        {
+            return Err(BoxError::from_static_str(
+                "udp_e2e_diagnostic_endpoints must be unique",
+            ));
+        }
+        if config
+            .udp_e2e_diagnostic_endpoints
+            .iter()
+            .any(|endpoint| endpoint.port == 0 || endpoint.host.try_as_ip().is_err())
+        {
+            return Err(BoxError::from_static_str(
+                "udp_e2e_diagnostic_endpoints must be nonzero IP endpoints",
+            ));
+        }
+        Ok(config)
+    }
+}
+
+fn is_canonical_uuid(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(index, byte)| match index {
+            8 | 13 | 18 | 23 => byte == b'-',
+            _ => byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte),
+        })
 }
 
 #[cfg(test)]
@@ -129,7 +203,11 @@ mod tests {
             br#"{
                 "udp_passthrough_ports":[443,53001],
                 "udp_blocked_endpoints":["8.8.8.8:53","[2001:4860:4860::8888]:53"],
-                "udp_e2e_mode":true
+                "udp_e2e_mode":true,
+                "evidence_run_uuid":"12345678-1234-4234-8234-123456789abc",
+                "udp_e2e_diagnostic_endpoints":["1.1.1.1:53","8.8.8.8:53"]
+                ,"udp_ingress_probe_lease_ms":500
+                ,"tcp_write_pump_max_pending_bytes":16384
             }"#,
         ))
         .expect("valid test config");
@@ -141,5 +219,27 @@ mod tests {
             "[2001:4860:4860::8888]:53"
         );
         assert!(config.udp_e2e_mode);
+        assert_eq!(
+            config.evidence_run_uuid.as_deref(),
+            Some("12345678-1234-4234-8234-123456789abc")
+        );
+        assert_eq!(config.udp_e2e_diagnostic_endpoints.len(), 2);
+        assert_eq!(config.udp_ingress_probe_lease_ms, Some(500));
+        assert_eq!(config.tcp_write_pump_max_pending_bytes, Some(16_384));
+    }
+
+    #[test]
+    fn signed_udp_diagnostics_fail_closed_without_exact_identity() {
+        for json in [
+            br#"{"udp_e2e_mode":true}"#.as_slice(),
+            br#"{"udp_e2e_mode":true,"evidence_run_uuid":"NOT-A-UUID","udp_e2e_diagnostic_endpoints":["1.1.1.1:53"]}"#.as_slice(),
+            br#"{"evidence_run_uuid":"12345678-1234-4234-8234-123456789abc","udp_e2e_diagnostic_endpoints":["1.1.1.1:53"]}"#.as_slice(),
+            br#"{"evidence_run_uuid":"NOT-A-UUID","udp_e2e_diagnostic_endpoints":["1.1.1.1:53"]}"#.as_slice(),
+            br#"{"udp_e2e_mode":true,"evidence_run_uuid":"12345678-1234-4234-8234-123456789abc","udp_e2e_diagnostic_endpoints":["1.1.1.1:53","1.1.1.1:53"]}"#.as_slice(),
+            br#"{"udp_e2e_mode":true,"evidence_run_uuid":"12345678-1234-4234-8234-123456789abc","udp_e2e_diagnostic_endpoints":["example.com:443"]}"#.as_slice(),
+            br#"{"udp_e2e_mode":true,"evidence_run_uuid":"12345678-1234-4234-8234-123456789abc","udp_e2e_diagnostic_endpoints":["127.0.0.1:0"]}"#.as_slice(),
+        ] {
+            assert!(DemoProxyConfig::from_opaque_config(Some(json)).is_err());
+        }
     }
 }

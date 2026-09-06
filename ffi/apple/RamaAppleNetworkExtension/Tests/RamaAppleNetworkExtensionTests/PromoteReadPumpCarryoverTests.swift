@@ -160,6 +160,46 @@ final class PromoteReadPumpCarryoverTests: XCTestCase {
             "in-flight bytes must reach the carryover sink intact")
     }
 
+    func testClientCancelOnFlowQueueBeatsQueuedReadCompletion() {
+        let engine = makeEngine(); defer { engine.stop(reason: 0) }
+        let session = interceptSession(engine)
+        let flow = MockTcpFlow()
+        let queue = makeQueue("client.cancel.queue-race")
+        let pump = TcpClientReadPump(
+            flow: flow,
+            session: session,
+            queue: queue,
+            logger: { _ in },
+            onTerminal: { _ in XCTFail("cutover owns terminal routing") })
+        pump.requestRead()
+        waitForReadDataIssued(flow)
+
+        let cancelBlockEntered = DispatchSemaphore(value: 0)
+        let allowCancel = DispatchSemaphore(value: 0)
+        let carryoverFired = expectation(description: "queued bytes carried over")
+        let completeFired = expectation(description: "cancel complete")
+        let payload = Data([0xA1, 0xB2, 0xC3])
+        queue.async {
+            cancelBlockEntered.signal()
+            allowCancel.wait()
+            pump.cancelForPromote(
+                onCarryover: { data in
+                    XCTAssertEqual(data, payload)
+                    carryoverFired.fulfill()
+                },
+                onComplete: { completeFired.fulfill() })
+        }
+        XCTAssertEqual(cancelBlockEntered.wait(timeout: .now() + 1), .success)
+        // Queue normal delivery behind the running cutover block. Production
+        // must install carryover inline before it acknowledges Rust.
+        flow.completeRead(data: payload, error: nil)
+        allowCancel.signal()
+
+        wait(for: [carryoverFired, completeFired], timeout: 2.0,
+             enforceOrder: true)
+        XCTAssertEqual(flow.pendingReadCount, 0)
+    }
+
     /// Same setup but the in-flight `readData` returns EOF
     /// `(nil, nil)`. The carryover sink fires with `.none`,
     /// signalling the direct forwarder to emit a FIN downstream.
@@ -194,10 +234,58 @@ final class PromoteReadPumpCarryoverTests: XCTestCase {
             "EOF on in-flight read must surface as `nil` to the carryover sink")
     }
 
-    /// Same shape but the in-flight `readData` returns an error.
-    /// Mapped to `.none` per cutover-EOF semantics: the direct
-    /// forwarder uses the FIN path either way.
-    func testClientReadPumpCarryoverErrorMapsToNone() {
+    /// EOF may win before the promote request reaches the flow queue. The
+    /// already-closed pump must replay that terminal edge once so the direct
+    /// forwarder never issues another read against the closed kernel half.
+    func testClientReadPumpReplaysEofObservedBeforePromote() {
+        let engine = makeEngine(); defer { engine.stop(reason: 0) }
+        let session = interceptSession(engine)
+        let flow = MockTcpFlow()
+        let queue = makeQueue("client.eof.before.promote")
+        let terminalFired = expectation(description: "natural EOF terminal")
+        let pump = TcpClientReadPump(
+            flow: flow,
+            session: session,
+            queue: queue,
+            logger: { _ in },
+            onTerminal: { error in
+                XCTAssertNil(error)
+                terminalFired.fulfill()
+            })
+        pump.requestRead()
+        waitForReadDataIssued(flow)
+        flow.completeRead(data: nil, error: nil)
+        wait(for: [terminalFired], timeout: 2.0)
+
+        let events = TestValue([String]())
+        let firstComplete = expectation(description: "first promote complete")
+        pump.cancelForPromote(
+            onCarryover: { data in
+                XCTAssertNil(data)
+                events.update { $0.append("eof") }
+            },
+            onComplete: {
+                events.update { $0.append("complete") }
+                firstComplete.fulfill()
+            })
+        wait(for: [firstComplete], timeout: 2.0)
+
+        let secondComplete = expectation(description: "second promote complete")
+        pump.cancelForPromote(
+            onCarryover: { _ in XCTFail("EOF must be replayed only once") },
+            onComplete: {
+                events.update { $0.append("complete") }
+                secondComplete.fulfill()
+            })
+        wait(for: [secondComplete], timeout: 2.0)
+        XCTAssertEqual(events.get(), ["eof", "complete", "complete"])
+        XCTAssertEqual(flow.pendingReadCount, 0)
+    }
+
+    /// Same shape but the in-flight `readData` returns an error. It must use
+    /// the distinct error channel; mapping it to EOF would make the promoted
+    /// forwarder close a reset kernel flow cleanly.
+    func testClientReadPumpCarryoverPreservesError() {
         let engine = makeEngine(); defer { engine.stop(reason: 0) }
         let session = interceptSession(engine)
         let flow = MockTcpFlow()
@@ -211,21 +299,24 @@ final class PromoteReadPumpCarryoverTests: XCTestCase {
         pump.requestRead()
         waitForReadDataIssued(flow)
 
-        let carryoverFired = expectation(description: "carryover fired")
+        let errorFired = expectation(description: "error fired")
         let completeFired = expectation(description: "onComplete fired")
-        let captured = TestValue<Data?>(Data([0xAA]))
+        let captured = TestValue<Error?>(nil)
         pump.cancelForPromote(
-            onCarryover: { data in
-                captured.set(data)
-                carryoverFired.fulfill()
+            onCarryover: { _ in
+                XCTFail("hard read error must not be mapped to EOF")
+            },
+            onError: { error in
+                captured.set(error)
+                errorFired.fulfill()
             },
             onComplete: { completeFired.fulfill() })
 
         flow.completeRead(data: nil, error: NSError(domain: "test", code: 1))
-        wait(for: [carryoverFired, completeFired], timeout: 2.0,
+        wait(for: [errorFired, completeFired], timeout: 2.0,
              enforceOrder: true)
-        XCTAssertNil(captured.get(),
-            "error on in-flight read must surface as `nil` to the carryover sink")
+        XCTAssertEqual((captured.get() as NSError?)?.domain, "test")
+        XCTAssertEqual((captured.get() as NSError?)?.code, 1)
     }
 
     /// `cancelForPromote` called twice is a no-op on the second
@@ -298,6 +389,57 @@ final class PromoteReadPumpCarryoverTests: XCTestCase {
         wait(for: [carryoverFired, completeFired], timeout: 2.0,
              enforceOrder: true)
         XCTAssertEqual(captured.get(), payload)
+    }
+
+    func testEgressCancelOnFlowQueueBeatsQueuedReceiveCompletion() {
+        let engine = makeEngine(); defer { engine.stop(reason: 0) }
+        let session = interceptSession(engine)
+        let conn = MockNwConnection()
+        let queue = makeQueue("egress.cancel.queue-race")
+        let pump = NwTcpConnectionReadPump(
+            connection: conn,
+            session: session,
+            queue: queue,
+            eofGraceDeadline: .milliseconds(50))
+        pump.start()
+        let issued = expectation(description: "pump issued receive")
+        DispatchQueue.global().async {
+            let deadline = Date(timeIntervalSinceNow: 1.0)
+            while Date() < deadline {
+                if conn.pendingReceiveCount > 0 {
+                    issued.fulfill()
+                    return
+                }
+                Thread.sleep(forTimeInterval: 0.005)
+            }
+        }
+        wait(for: [issued], timeout: 1.5)
+
+        let cancelBlockEntered = DispatchSemaphore(value: 0)
+        let allowCancel = DispatchSemaphore(value: 0)
+        let carryoverFired = expectation(description: "queued receive carried over")
+        let completeFired = expectation(description: "cancel complete")
+        let payload = Data([0xD4, 0xE5])
+        queue.async {
+            cancelBlockEntered.signal()
+            allowCancel.wait()
+            pump.cancelForPromote(
+                onCarryover: { data in
+                    XCTAssertEqual(data, payload)
+                    carryoverFired.fulfill()
+                },
+                onComplete: { completeFired.fulfill() })
+        }
+        XCTAssertEqual(cancelBlockEntered.wait(timeout: .now() + 1), .success)
+        _ = conn.completePendingReceive(
+            data: payload,
+            isComplete: false,
+            error: nil)
+        allowCancel.signal()
+
+        wait(for: [carryoverFired, completeFired], timeout: 2.0,
+             enforceOrder: true)
+        XCTAssertEqual(conn.pendingReceiveCount, 0)
     }
 
     /// In-flight `connection.receive` returning `isComplete: true`

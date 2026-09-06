@@ -293,6 +293,7 @@ final class ProviderStaticHelperTests: XCTestCase {
             flowPressureSoftCap: defaultFlowPressureSoftCap,
             flowPressureLowWater: defaultFlowPressureLowWater,
             flowPressureIdleFloorMs: defaultFlowPressureIdleFloorMs,
+            liveFlowHardCap: defaultLiveFlowHardCap,
             tcpStartInFlightHardCap: defaultTcpStartInFlightHardCap,
             tcpStartInFlightSoftCap: defaultTcpStartInFlightSoftCap,
             tcpStartLatencyBreakerP95Ms: defaultTcpStartLatencyBreakerP95Ms,
@@ -317,6 +318,8 @@ final class ProviderStaticHelperTests: XCTestCase {
         let savedFlowSoftCap = defaultFlowPressureSoftCap
         let savedFlowLowWater = defaultFlowPressureLowWater
         let savedFlowIdleFloor = defaultFlowPressureIdleFloorMs
+        let savedLiveHardCap = defaultLiveFlowHardCap
+        let savedUdpIdleTimeout = defaultUdpIdleTimeoutMs
         let savedHardCap = defaultTcpStartInFlightHardCap
         let savedSoftCap = defaultTcpStartInFlightSoftCap
         let savedOpenP95 = defaultTcpStartLatencyBreakerP95Ms
@@ -330,6 +333,8 @@ final class ProviderStaticHelperTests: XCTestCase {
             defaultFlowPressureSoftCap = savedFlowSoftCap
             defaultFlowPressureLowWater = savedFlowLowWater
             defaultFlowPressureIdleFloorMs = savedFlowIdleFloor
+            defaultLiveFlowHardCap = savedLiveHardCap
+            defaultUdpIdleTimeoutMs = savedUdpIdleTimeout
             defaultTcpStartInFlightHardCap = savedHardCap
             defaultTcpStartInFlightSoftCap = savedSoftCap
             defaultTcpStartLatencyBreakerP95Ms = savedOpenP95
@@ -346,6 +351,8 @@ final class ProviderStaticHelperTests: XCTestCase {
             flowPressureSoftCap: 11,
             flowPressureLowWater: 12,
             flowPressureIdleFloorMs: 13,
+            liveFlowHardCap: 20,
+            udpIdleTimeoutMs: 12_345,
             tcpStartInFlightHardCap: 14,
             tcpStartInFlightSoftCap: 15,
             tcpStartLatencyBreakerP95Ms: 16,
@@ -361,16 +368,120 @@ final class ProviderStaticHelperTests: XCTestCase {
         XCTAssertEqual(writePumpMaxPendingBytes, 10_000)
         XCTAssertEqual(writePumpHwmLogThresholdBytes, 5_000)
         XCTAssertEqual(defaultFlowPressureSoftCap, 11)
-        XCTAssertEqual(defaultFlowPressureLowWater, 12)
+        XCTAssertEqual(defaultFlowPressureLowWater, 10)
         XCTAssertEqual(defaultFlowPressureIdleFloorMs, 13)
+        XCTAssertEqual(defaultLiveFlowHardCap, 20)
+        XCTAssertEqual(defaultUdpIdleTimeoutMs, 12_345)
         XCTAssertEqual(defaultTcpStartInFlightHardCap, 14)
-        XCTAssertEqual(defaultTcpStartInFlightSoftCap, 15)
+        XCTAssertEqual(defaultTcpStartInFlightSoftCap, 14)
         XCTAssertEqual(defaultTcpStartLatencyBreakerP95Ms, 16)
         XCTAssertEqual(defaultTcpStartLatencyBreakerCloseP95Ms, 17)
         XCTAssertEqual(defaultTcpPressureConnectTimeoutMs, 18)
         XCTAssertEqual(defaultTcpBreakerConnectTimeoutMs, 19)
         XCTAssertFalse(defaultFlowRefusalPassthrough)
-        XCTAssertEqual(logs.count, 4)
+        XCTAssertEqual(logs.count, 6)
+        XCTAssertTrue(logs.contains { $0.contains("lowWater=12 outside 0..<11; using 10") })
+        XCTAssertTrue(logs.contains { $0.contains("tcp start softCap=15 exceeds enabled hardCap=14; using 14") })
+    }
+
+    func testFlowPressureLowWaterNormalization() {
+        XCTAssertEqual(normalizedFlowPressureLowWater(softCap: 10, lowWater: 0), 0)
+        XCTAssertEqual(normalizedFlowPressureLowWater(softCap: 10, lowWater: 5), 5)
+        XCTAssertEqual(normalizedFlowPressureLowWater(softCap: 10, lowWater: 10), 9)
+        XCTAssertEqual(normalizedFlowPressureLowWater(softCap: 1, lowWater: 10), 0)
+        XCTAssertEqual(normalizedFlowPressureLowWater(softCap: 0, lowWater: 11), 11)
+    }
+
+    func testFlowPressureSoftCapNormalizationPreservesDisableSemantics() {
+        XCTAssertEqual(normalizedFlowPressureSoftCap(softCap: 10, hardCap: 20), 10)
+        XCTAssertEqual(normalizedFlowPressureSoftCap(softCap: 20, hardCap: 10), 10)
+        XCTAssertEqual(normalizedFlowPressureSoftCap(softCap: 0, hardCap: 10), 0)
+        XCTAssertEqual(normalizedFlowPressureSoftCap(softCap: 10, hardCap: 0), 10)
+        XCTAssertEqual(normalizedFlowPressureSoftCap(softCap: 0, hardCap: 0), 0)
+    }
+
+    func testTcpStartSoftCapNormalizationPreservesDisableSemantics() {
+        XCTAssertEqual(normalizedTcpStartSoftCap(softCap: 10, hardCap: 20), 10)
+        XCTAssertEqual(normalizedTcpStartSoftCap(softCap: 20, hardCap: 10), 10)
+        XCTAssertEqual(normalizedTcpStartSoftCap(softCap: 0, hardCap: 10), 0)
+        XCTAssertEqual(normalizedTcpStartSoftCap(softCap: 10, hardCap: 0), 10)
+        XCTAssertEqual(normalizedTcpStartSoftCap(softCap: 0, hardCap: 0), 0)
+    }
+
+    func testApplyRuntimeConfigBoundsSoftCapByHardCapThenNormalizesLowWater() {
+        let savedSoftCap = defaultFlowPressureSoftCap
+        let savedLowWater = defaultFlowPressureLowWater
+        let savedHardCap = defaultLiveFlowHardCap
+        defer {
+            defaultFlowPressureSoftCap = savedSoftCap
+            defaultFlowPressureLowWater = savedLowWater
+            defaultLiveFlowHardCap = savedHardCap
+        }
+        let startup = RamaTransparentProxyConfigBridge(
+            tunnelRemoteAddress: "240.0.0.1",
+            rules: [],
+            tcpWritePumpMaxPendingBytes: writePumpMaxPendingBytes,
+            flowPressureSoftCap: 10,
+            flowPressureLowWater: 8,
+            flowPressureIdleFloorMs: defaultFlowPressureIdleFloorMs,
+            liveFlowHardCap: 4,
+            tcpStartInFlightHardCap: defaultTcpStartInFlightHardCap,
+            tcpStartInFlightSoftCap: defaultTcpStartInFlightSoftCap,
+            tcpStartLatencyBreakerP95Ms: defaultTcpStartLatencyBreakerP95Ms,
+            tcpStartLatencyBreakerCloseP95Ms: defaultTcpStartLatencyBreakerCloseP95Ms,
+            tcpPressureConnectTimeoutMs: defaultTcpPressureConnectTimeoutMs,
+            tcpBreakerConnectTimeoutMs: defaultTcpBreakerConnectTimeoutMs,
+            flowRefusalPassthrough: defaultFlowRefusalPassthrough)
+        var logs: [String] = []
+
+        RamaTransparentProxyProvider.applyRuntimeConfig(from: startup) {
+            logs.append($0)
+        }
+
+        XCTAssertEqual(defaultFlowPressureSoftCap, 4)
+        XCTAssertEqual(defaultFlowPressureLowWater, 3)
+        XCTAssertEqual(defaultLiveFlowHardCap, 4)
+        XCTAssertTrue(logs.contains {
+            $0.contains("softCap=10 exceeds enabled liveHardCap=4; using 4")
+        })
+        XCTAssertTrue(logs.contains {
+            $0.contains("lowWater=8 outside 0..<4; using 3")
+        })
+    }
+
+    func testApplyRuntimeConfigPreservesValidAndDisabledPressureTargets() {
+        let savedSoftCap = defaultFlowPressureSoftCap
+        let savedLowWater = defaultFlowPressureLowWater
+        defer {
+            defaultFlowPressureSoftCap = savedSoftCap
+            defaultFlowPressureLowWater = savedLowWater
+        }
+        for (softCap, lowWater) in [(10 as UInt32, 5 as UInt32), (10, 0), (0, 11)] {
+            let startup = RamaTransparentProxyConfigBridge(
+                tunnelRemoteAddress: "240.0.0.1",
+                rules: [],
+                tcpWritePumpMaxPendingBytes: writePumpMaxPendingBytes,
+                flowPressureSoftCap: softCap,
+                flowPressureLowWater: lowWater,
+                flowPressureIdleFloorMs: defaultFlowPressureIdleFloorMs,
+                liveFlowHardCap: defaultLiveFlowHardCap,
+                tcpStartInFlightHardCap: defaultTcpStartInFlightHardCap,
+                tcpStartInFlightSoftCap: defaultTcpStartInFlightSoftCap,
+                tcpStartLatencyBreakerP95Ms: defaultTcpStartLatencyBreakerP95Ms,
+                tcpStartLatencyBreakerCloseP95Ms: defaultTcpStartLatencyBreakerCloseP95Ms,
+                tcpPressureConnectTimeoutMs: defaultTcpPressureConnectTimeoutMs,
+                tcpBreakerConnectTimeoutMs: defaultTcpBreakerConnectTimeoutMs,
+                flowRefusalPassthrough: defaultFlowRefusalPassthrough)
+            var logs: [String] = []
+
+            RamaTransparentProxyProvider.applyRuntimeConfig(from: startup) {
+                logs.append($0)
+            }
+
+            XCTAssertEqual(defaultFlowPressureSoftCap, softCap)
+            XCTAssertEqual(defaultFlowPressureLowWater, lowWater)
+            XCTAssertFalse(logs.contains { $0.contains("outside") }, logs.joined(separator: "\n"))
+        }
     }
 
     func testBuildNetworkSettingsRoutesIncludesAndExcludes() {

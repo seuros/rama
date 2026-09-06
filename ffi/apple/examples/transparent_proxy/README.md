@@ -20,7 +20,19 @@ just build-tproxy-dev
 ```
 
 This builds the Rust staticlib and the developer-signed macOS container app + system extension.
-The Rust staticlib is produced at:
+Clean signed builds compile both Rust architectures from a pinned source archive.
+Developer builds default to Debug. For on-device performance measurements, set
+`RAMA_TPROXY_CONFIGURATION=Release` to optimize both Rust and Swift; the app is
+then under `.xcode-derived/tproxy-app-dev/Build/Products/Release/`. Developer ID
+distribution builds always use Release for both languages.
+
+To build and install an optimized developer-signed app:
+
+```sh
+RAMA_TPROXY_CONFIGURATION=Release just install-tproxy-app-dev
+```
+
+For a standalone universal Rust library, run `just build-tproxy-rs`. It produces:
 
 ```
 ffi/apple/examples/transparent_proxy/tproxy_rs/target/universal/librama_tproxy_example.a
@@ -251,6 +263,14 @@ Teams do not have to distribute the `Developer ID Application` private key to ev
 
 This example does not implement a specific cloud-signing provider, but the distribution mode is compatible with that workflow: the important requirement is that the final distribution build is signed with the correct `Developer ID Application` identity and the matching distribution provisioning profiles.
 
+### Sanitizer coverage
+
+`just test-e2e-sanitizers` runs two complementary passes. Rust AddressSanitizer
+exercises the FFI stress cases for memory errors such as use-after-free; ASan
+does not detect data races. Swift ThreadSanitizer covers instrumented Swift-side
+code, but it does not instrument the linked Rust static library. The combined
+recipe therefore does not claim complete Rust race coverage.
+
 ### Why the split exists
 
 A non-admin developer cannot usually rely on self-service `Developer ID` signing the way they can rely on `Apple Development` signing in Xcode.
@@ -262,106 +282,30 @@ So this example deliberately demonstrates both:
 
 ## Logs
 
-### Signed modern UDP callback E2E (macOS 15+)
+### UDP diagnostics
 
-The signed example includes a real-socket test for
-`NEAppProxyUDPFlowHandling`. It installs the current development build,
-passes test-only policy overrides as non-persisted start options, and
-drives public protocol endpoints through the active system extension:
-
-- Cloudflare DNS (`1.1.1.1:53`) declined by Rama (`false`, direct pass-through)
-- Cloudflare NTP (`162.159.200.1:123`) accepted by Rama (`true`, UDP forwarding)
-- Google Public DNS (`8.8.8.8:53`) accepted then closed by Rama (`true`, blocked)
-- Cloudflare HTTP/3 declined by Rama (`false`, direct UDP/443 pass-through)
-
-Run it on a macOS 15+ signing host where the development system extension has
-been approved:
+Run the Swift and Rust FFI regression suites with `just test-e2e`. The standalone
+protocol probe supports DNS, NTP, HTTP/3, and controlled UDP echo workloads:
 
 ```sh
-just test-modern-udp-signed
+python3 scripts/modern_udp_e2e_probe.py --help
 ```
 
-The test first reaches every public resource with an unblocked profile, then
-enables the exact blocked-DNS override. It captures the provider's structured
-Rust log, verifies the exact remote address/port and Rama decision, verifies
-pass-through flows never enter provider handling, and checks that the accepted
-NTP endpoint reaches Rama's UDP forwarding service. On macOS 15+, an exact
-initial endpoint reaching Rust also proves that the modern typed callback
-delivered the flow; the generic fallback has no public remote endpoint to
-forward. The UDP/443 request uses Apple's
-`nscurl --http3-prior-knowledge` and requires the response to report
-`http=http/3`; the matching provider record must also be a fresh UDP/443 flow
-attributed to `com.apple.nscurl`, so a TCP fallback or an unrelated background
-QUIC flow cannot satisfy it.
+The example's marker/hold/sink path requires the explicit Rust `e2e` feature and
+`udp_e2e_mode` launch configuration. Ordinary builds reject that configuration.
+Use that feature only for a diagnostic build; it is disabled by default.
 
-Exact endpoint and source-application fields remain private during normal
-operation. The example Rust policy owns the E2E mode, probe allowlist, public
-test diagnostics, and ten-minute expiry for temporary UDP overrides. The
-reusable `RamaAppleNetworkExtension` provider remains final and contains no
-test policy or probe knowledge. Rust receives the normalized source-app bundle
-identifier, so both bare and team-prefixed `python3` signing identifiers resolve
-to `com.apple.python3`. Unrelated background flows remain private, and the mode
-is passed through `startOptions` without ever being written to the saved
-`NETransparentProxyManager` profile. Downstream users configure and decide UDP
-flows in Rust; they do not need a custom Swift provider.
+UDP overload is bounded and lossy. Swift retains an admissible prefix of each
+Apple read completion; excess datagrams are dropped with sampled diagnostics.
+Under Rust global-byte exhaustion, one FIFO probe lease admits one datagram.
+The remainder of that completion competes for ordinary capacity and can be
+rejected while other flows wait. ACKs identify the exact probe owner and do not
+reserve a whole read batch. These bounds protect memory and fair recovery;
+heavy QUIC throughput still needs signed, on-device qualification.
 
-The default targets are maintained public services and therefore require
-Internet access. They can be replaced for a restricted runner with
-`RAMA_TPROXY_E2E_PASSTHROUGH_DNS`, `RAMA_TPROXY_E2E_INTERCEPT_NTP`,
-`RAMA_TPROXY_E2E_BLOCKED_DNS`, and `RAMA_TPROXY_E2E_HTTP3_URL`. The first three
-values must be IP literals so callback-log assertions remain deterministic.
-No local privileged bind or `sudo` is required by this test.
-
-The legacy callback remains compile- and unit-tested on current CI. On the
-oldest supported pre-macOS-15 signing host, run the same real-socket probe with
-the explicit legacy opt-in:
-
-```sh
-RAMA_TPROXY_ALLOW_LEGACY_UDP_E2E=1 just test-modern-udp-signed
-```
-
-That run retains the same Rust pass-through, intercept, block, endpoint, and
-UDP/443 assertions. An older signed runner is not currently available in hosted
-CI.
-
-Check the extension is registered, then stream Rama and NetworkExtension
-events. Use `--level debug` for `log stream`; `log show` has separate
-`--info --debug` output flags and otherwise returns default-level events only.
-
-```sh
-systemextensionsctl list
-log stream --level debug --style compact \
-  --predicate 'subsystem BEGINSWITH "org.ramaproxy.example.tproxy" OR process == "neagent" OR process == "nesessionmanager" OR process == "sysextd" OR process == "launchd"'
-
-log show --last 5m --style compact --info --debug \
-  --predicate 'subsystem BEGINSWITH "org.ramaproxy.example.tproxy" OR process == "neagent" OR process == "nesessionmanager" OR process == "sysextd" OR process == "launchd"'
-```
-
-`--info` and `--debug` only select events that macOS retained; they do not
-retroactively persist debug events. For a planned reproduction, keep
-`log stream --level debug` running. To make a later replay self-contained,
-temporarily enable debug persistence and reset it after the reproduction:
-The subsystem below is the development provider bundle identifier; substitute
-the installed provider identifier for another build flavor.
-
-```sh
-sudo log config --subsystem org.ramaproxy.example.tproxy.dev.provider \
-  --mode level:debug,persist:debug
-# reproduce, then export with `log show --info --debug` or `log collect`
-sudo log config --subsystem org.ramaproxy.example.tproxy.dev.provider --reset
-```
-
-Private metadata remains `<private>` by design; `sudo` does not turn a
-redacted field public. Lifecycle text, counters, and other support-critical
-summaries are emitted separately as public fields. Rust `tracing` events
-share the same subsystem — see
-[Observability with dial9](#observability-with-dial9).
-
-The example exports its own and the Apple bridge's debug events, while other
-Rama targets default to info to avoid per-chunk protocol noise. WebSocket
-payloads are never logged; process arguments are included only as private
-demo metadata. Per-message WebSocket events are trace-level and therefore
-omitted from this debug stream.
+UDP contributes to the shared 500-flow hard cap but is not a TCP reaper victim.
+A UDP-dominant population therefore relies on natural close, the UDP idle
+watchdog, and configured refusal of new flows for relief.
 
 ## Troubleshooting
 
@@ -415,6 +359,48 @@ plutil -p /Library/SystemExtensions/*/\
 org.ramaproxy.example.tproxy.dev.provider.systemextension/Contents/Info.plist \
   | grep -E 'NEMach|TProxy|XpcService|BundleVersion'
 ```
+
+### Allocator memory snapshot
+
+The signed container can query the already-running provider without launching
+the menu app, activating the extension, changing a profile, or requiring sudo:
+
+```sh
+/Applications/RamaTransparentProxyExampleContainer.app/Contents/MacOS/RamaTransparentProxyExampleContainer \
+  --allocator-stats > /tmp/rama-allocator-stats.json
+```
+
+Use this flag alone. The command uses the existing XPC peer checks (same signing
+team and exact container/provider identifiers), prints one JSON reply, and exits
+nonzero on unavailable statistics, connection errors, or a 10-second deadline.
+The container must match the installed provider's versioned Mach service name.
+It does not start an inactive proxy.
+
+Default builds enable jemalloc statistics. A snapshot refreshes the statistics
+epoch once, then reads byte counts (`allocated`, `active`, `resident`, `metadata`,
+`mapped`, `retained`), all-arena dirty/muzzy page counts, page size, arena limit
+(`narenas`), and
+background/decay settings. Each optional setting has a `value` or an `error`;
+unsupported settings are not reported as zero. `arenas_*_decay_ms` are defaults
+for new arenas, not an assertion about each existing arena. System-allocator
+builds (`--no-default-features`, including ASan) explicitly report unavailable.
+
+Compare snapshots from the same provider PID at baseline, load, and idle tail.
+`allocated` estimates live jemalloc allocations, `active` includes fragmentation,
+and `resident` estimates resident pages including allocator metadata and dirty
+pages. `mapped` counts mapped active extents; `retained` is reserved virtual
+memory and is not an RSS count. These readings exclude Swift/Apple malloc
+and are not an atomic snapshot of a busy process; thread caches and collection
+timing also affect accounting. Pair them with RSS/`vmmap`, alongside measured workload latency and throughput. The diagnostic never purges arenas, flushes caches,
+or changes decay/background-thread policy; enabling statistics adds accounting
+overhead that belongs in the subsequent performance qualification. Refreshing
+statistics also takes allocator locks and has a cost; use occasional diagnostic
+samples rather than treating this as a per-flow or high-frequency monitor.
+
+The example keeps jemalloc's default decay policy. Measure live allocations,
+fragmentation, and process footprint before changing that policy. A whole-process
+RSS limit must account for the configured Swift writer and UDP staging envelopes,
+Rust retained payloads, runtime overhead, and Apple framework allocations.
 
 ### Wire capture (for diagnosing TLS / handshake issues)
 
@@ -514,72 +500,39 @@ connectivity without a reboot. (For the consuming product, replace the
 `org.ramaproxy.example.tproxy` ids with that product's subsystem /
 provider ids.)
 
-## Stress + resource-usage testing
+## Stress and resource measurements
 
-### One-click traffic stress
-
-Run live traffic against public HTTP/HTTPS endpoints while the
-sysext is active. Small/large GETs, large POST bodies, plain HTTP,
-parallel connections, HTTP/1.1 ↔ HTTP/2 mix, quick connection churn:
+With the proxy installed and active, run:
 
 ```sh
-just stress-traffic
+just stress-traffic --duration 120 --concurrency 32
+just stress-traffic --help
+just test-tools
 ```
 
-Tunables (env vars):
+The load tool cycles through HTTP, HTTPS HTTP/1.1, HTTP/2, large downloads, and
+POST uploads. Use `--http-url` and `--https-url` to target a controlled HTTP test
+server implementing `/method`, `/bytes?size=N`, and `/octet-stream`. Requests
+stop starting at the duration limit; in-flight requests get up to 20 seconds to
+finish. Interrupting stops new requests and waits for that bounded drain.
+
+JSON results report request counts, failures, downloaded bytes, throughput, and
+an upper bound on p95 latency from power-of-two millisecond buckets. Curl errors,
+truncated responses, and HTTP failures produce a nonzero exit. The tool does not
+change proxy configuration or infer a memory threshold from traffic results.
+Compare equivalent workloads with and without the proxy and measure the provider
+separately using the tools below.
+
+`just test-tools` runs ShellCheck (`brew install shellcheck`) and the pressure-parser,
+protocol-probe, and HTTP-load regressions. A skipped test fails the gate. `check-spec-parity` also checks that
+the parser matches the Swift/Rust pressure telemetry. Parse retained os_log
+records with the command below. It reports malformed telemetry and sampled drops;
+a successful parse does not prove a workload or pressure recovery was exercised.
 
 ```sh
-STRESS_DURATION=120 STRESS_CONCURRENCY=32 just stress-traffic
-STRESS_LARGE_BYTES=$((64 * 1024 * 1024)) just stress-traffic   # 64 MiB GET
+python3 scripts/pressure_log.py provider.ndjson --pid 12345 \
+    --subsystem org.ramaproxy.example.tproxy.dev.provider
 ```
-
-To couple the run with periodic resource sampling of the extension
-process — and to enable pre/post-run `vmmap`+`heap` snapshots so
-the diff sits in the same log dir — hand the script the sysext PID
-via `STRESS_MONITOR_PID`:
-
-```sh
-STRESS_MONITOR_PID=$(pgrep -f org.ramaproxy.example.tproxy.dev.provider) \
-  just stress-traffic
-```
-
-For a more diagnostic run, capture the system log alongside the
-stress run and pass it via `STRESS_NDJSON` so the summary prints a
-close-reason histogram:
-
-```sh
-# Cache a sudo timestamp first so the script can capture
-# vmmap/heap snapshots non-interactively without hanging on a
-# password prompt (the sysext is root-owned).
-sudo -v
-
-START="$(date -u '+%Y-%m-%d %H:%M:%S')"
-STRESS_MONITOR_PID=$(pgrep -f org.ramaproxy.example.tproxy.dev.provider) \
-  STRESS_DURATION=180 just stress-traffic
-
-# After the run, capture the system log for the same window:
-sudo log show \
-  --predicate 'subsystem BEGINSWITH "org.ramaproxy.example.tproxy" OR subsystem == "com.apple.networkextension" OR subsystem == "com.apple.network"' \
-  --info --debug \
-  --start "$START" --style ndjson > /tmp/system.ndjson
-
-# Re-run the script in analysis-only mode:
-STRESS_NDJSON=/tmp/system.ndjson STRESS_DURATION=0 just stress-traffic
-sudo leaks $(pgrep -f org.ramaproxy.example.tproxy.dev.provider) | head -50
-```
-
-The script writes per-worker logs to a tmp directory and prints,
-on exit:
-
-- per-worker `iters / ok / fail` summary
-- top-5 errors per worker (4xx/5xx, `000` transport failures, curl errors)
-- truncation scan: `curl: ... N out of M bytes received` lines
-- pre/post `vmmap`+`heap` snapshot if `STRESS_MONITOR_PID` was set
-- close-reason histogram if `STRESS_NDJSON` points at a captured
-  system log
-
-Pair with [Bundle everything for offline triage](#bundle-everything-for-offline-triage)
-below to also collect dial9 traces from the same window.
 
 ### Apple-native resource and leak inspection
 
@@ -606,7 +559,7 @@ A typical leak-hunt loop while stress is running:
 ```sh
 PID=$(pgrep -f org.ramaproxy.example.tproxy.dev.provider)
 sudo heap $PID > /tmp/heap.before.txt
-STRESS_DURATION=180 just stress-traffic
+just stress-traffic --duration 180
 sudo heap $PID > /tmp/heap.after.txt
 diff /tmp/heap.before.txt /tmp/heap.after.txt | head -60
 sudo leaks $PID

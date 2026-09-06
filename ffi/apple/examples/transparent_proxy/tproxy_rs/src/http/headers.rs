@@ -1,10 +1,8 @@
-use rama::{
-    http::{
-        HeaderName, HeaderValue,
-        headers::{HeaderEncode, TypedHeader},
-    },
-    telemetry::tracing,
+use rama::http::{
+    HeaderName, HeaderValue,
+    headers::{HeaderEncode, TypedHeader},
 };
+use rama::telemetry::tracing;
 
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]

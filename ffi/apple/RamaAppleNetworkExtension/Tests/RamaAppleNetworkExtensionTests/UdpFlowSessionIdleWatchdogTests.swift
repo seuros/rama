@@ -19,7 +19,7 @@ final class UdpFlowSessionIdleWatchdogTests: XCTestCase {
         let flow: MockUdpFlow
         let session: UdpFlowSession<MockUdpFlow>
 
-        init(idleTimeoutMs: UInt32) {
+        init(idleTimeoutMs: UInt64) {
             self.core = TransparentProxyCore()
             self.flow = MockUdpFlow()
             let meta = RamaTransparentProxyFlowMetaBridge(
@@ -41,6 +41,19 @@ final class UdpFlowSessionIdleWatchdogTests: XCTestCase {
         }
     }
 
+    func testTimeoutConversionSaturatesInsteadOfWrapping() {
+        XCTAssertEqual(udpIdleTimeoutNanoseconds(60_000), 60_000_000_000)
+        XCTAssertEqual(
+            udpIdleTimeoutNanoseconds(UInt64.max / 1_000_000),
+            (UInt64.max / 1_000_000) * 1_000_000
+        )
+        XCTAssertEqual(
+            udpIdleTimeoutNanoseconds(UInt64.max / 1_000_000 + 1),
+            UInt64.max
+        )
+        XCTAssertEqual(udpIdleTimeoutNanoseconds(UInt64.max), UInt64.max)
+    }
+
     /// With `idleTimeoutMs == 0` the watchdog is disabled: `armIdleTimer`
     /// schedules nothing. This is the explicit opt-out for tests that
     /// exercise other phase code.
@@ -50,26 +63,49 @@ final class UdpFlowSessionIdleWatchdogTests: XCTestCase {
         fx.session.flowQueue.async { fx.session.armIdleTimer() }
         fx.drainFlowQueue()
         XCTAssertNil(fx.session.idleWork, "zero timeout must leave idleWork nil")
+        #if DEBUG || RAMA_TESTING
+            XCTAssertEqual(fx.session.idleTimerScheduleCount, 0)
+        #endif
     }
 
-    /// `armIdleTimer` schedules a work item; calling it again before
-    /// fire cancels the previous one. (Otherwise back-to-back datagrams
-    /// would leave stale work queued and the watchdog would fire too
-    /// early or duplicate.)
-    func testArmIdleTimerCancelsPreviousWorkOnRearm() {
+    /// A high-rate datagram burst changes only the activity timestamp.
+    /// It must retain the original work item and perform exactly one
+    /// queue schedule until that item fires.
+    func testActivityBurstDoesNotRescheduleTimer() {
         let fx = Fixture(idleTimeoutMs: 10_000) // long enough not to fire mid-test
         fx.session.installTerminate()
-        fx.session.flowQueue.async { fx.session.armIdleTimer() }
+        let base = DispatchTime.now().uptimeNanoseconds
+        fx.session.flowQueue.async {
+            fx.session.armIdleTimer(nowUptimeNs: base)
+        }
         fx.drainFlowQueue()
         let first = fx.session.idleWork
         XCTAssertNotNil(first)
+        #if DEBUG || RAMA_TESTING
+            XCTAssertEqual(fx.session.idleTimerScheduleCount, 1)
+        #endif
 
-        fx.session.flowQueue.async { fx.session.armIdleTimer() }
+        fx.session.flowQueue.async {
+            for offset in 1...50_000 {
+                fx.session.recordIdleActivity(
+                    nowUptimeNs: base + UInt64(offset)
+                )
+            }
+        }
         fx.drainFlowQueue()
-        let second = fx.session.idleWork
-        XCTAssertNotNil(second)
-        XCTAssertFalse(first === second, "rearm must replace the work item")
-        XCTAssertTrue(first?.isCancelled ?? false, "the previous work item must be cancelled")
+
+        XCTAssertTrue(first === fx.session.idleWork)
+        XCTAssertFalse(first?.isCancelled ?? true)
+        #if DEBUG || RAMA_TESTING
+            XCTAssertEqual(fx.session.idleTimerScheduleCount, 1)
+        #endif
+
+        let terminated = expectation(description: "burst fixture terminated")
+        fx.session.flowQueue.async {
+            fx.session.ctx.terminate?(nil)
+            fx.session.flowQueue.async { terminated.fulfill() }
+        }
+        wait(for: [terminated], timeout: 2.0)
     }
 
     /// After `idleTimeoutMs` elapses with no activity, the watchdog
@@ -121,38 +157,73 @@ final class UdpFlowSessionIdleWatchdogTests: XCTestCase {
         XCTAssertNil(fx.session.idleWork, "terminate must nil the idleWork reference")
     }
 
-    /// Re-arming before the timer fires resets the deadline. Pin the
-    /// observable: an arm at t=0 with a 100 ms timeout, plus a re-arm
-    /// at t=70 ms, must not fire at t=100 ms — only at t=170 ms.
-    func testRearmExtendsDeadline() {
-        let fx = Fixture(idleTimeoutMs: 100)
+    /// A timer firing at the original deadline observes activity at
+    /// +70 ms and schedules exactly the remaining 70 ms. A fire at
+    /// the extended deadline then terminates. Explicit monotonic times
+    /// make this independent of wall-clock scheduling jitter.
+    func testActivityExtendsDeadlineAtTimerFire() {
+        let fx = Fixture(idleTimeoutMs: 100_000)
         fx.session.installTerminate()
         fx.core.registerUdpFlow(fx.session.flowId, anchor: fx.session)
-        fx.session.flowQueue.async { fx.session.armIdleTimer() }
+        let base = DispatchTime.now().uptimeNanoseconds
+        let timeoutNs = UInt64(fx.session.idleTimeoutMs) * 1_000_000
+        let activityAt = base + 70_000_000
 
-        // Rearm at +70 ms.
-        fx.session.flowQueue.asyncAfter(deadline: .now() + .milliseconds(70)) {
-            fx.session.armIdleTimer()
-        }
+        let reconciled = expectation(description: "extended idle timer reconciled")
+        fx.session.flowQueue.async {
+            fx.session.armIdleTimer(nowUptimeNs: base)
+            let first = fx.session.idleWork
+            fx.session.recordIdleActivity(nowUptimeNs: activityAt)
 
-        // At +130 ms (past the original deadline, before the rearmed
-        // one), the watchdog must NOT have fired yet.
-        let midCheck = expectation(description: "still alive at +130ms")
-        fx.session.flowQueue.asyncAfter(deadline: .now() + .milliseconds(130)) {
-            XCTAssertNotEqual(fx.session.ctx.readState, .closed,
-                              "rearm at +70ms must extend deadline past +100ms")
-            midCheck.fulfill()
-        }
-        wait(for: [midCheck], timeout: 2.0)
+            // Simulate the original item firing at its deadline. Cancel
+            // its real delayed delivery because this test drives the
+            // same state transition with an explicit monotonic time.
+            first?.cancel()
+            fx.session.handleIdleTimerFire(nowUptimeNs: base + timeoutNs)
 
-        // At +250 ms (past the rearmed deadline), it should have fired.
-        let lateCheck = expectation(description: "fired by +250ms")
-        fx.session.flowQueue.asyncAfter(deadline: .now() + .milliseconds(150)) {
-            lateCheck.fulfill()
+            XCTAssertNotEqual(fx.session.ctx.readState, .closed)
+            XCTAssertFalse(first === fx.session.idleWork)
+            #if DEBUG || RAMA_TESTING
+                XCTAssertEqual(fx.session.idleTimerScheduleCount, 2)
+            #endif
+
+            fx.session.idleWork?.cancel()
+            fx.session.handleIdleTimerFire(
+                nowUptimeNs: activityAt + timeoutNs
+            )
+            fx.session.flowQueue.async { reconciled.fulfill() }
         }
-        wait(for: [lateCheck], timeout: 2.0)
+        wait(for: [reconciled], timeout: 2.0)
+
         XCTAssertEqual(fx.session.ctx.readState, .closed)
         XCTAssertEqual(fx.core.udpFlowCount, 0)
+    }
+
+    func testReadCallbackRecordsActivityBeforeFlowQueueDispatch() {
+        let fx = Fixture(idleTimeoutMs: 100_000)
+        let priorActivity = DispatchTime.now().uptimeNanoseconds
+        fx.session.recordIdleActivity(nowUptimeNs: priorActivity)
+
+        let blockerStarted = DispatchSemaphore(value: 0)
+        let releaseBlocker = DispatchSemaphore(value: 0)
+        fx.session.flowQueue.async {
+            blockerStarted.signal()
+            releaseBlocker.wait()
+        }
+        XCTAssertEqual(blockerStarted.wait(timeout: .now() + 1), .success)
+
+        fx.session.handleReadCompletion(
+            datagrams: [Data("activity".utf8)],
+            endpoints: nil,
+            error: nil)
+
+        XCTAssertGreaterThan(
+            fx.session.testIdleActivitySnapshot.lastUptimeNs ?? 0,
+            priorActivity,
+            "callback entry must publish activity while queue processing is still blocked")
+
+        releaseBlocker.signal()
+        fx.drainFlowQueue()
     }
 
     /// Lifecycle invariant: when `start()` takes any non-intercept

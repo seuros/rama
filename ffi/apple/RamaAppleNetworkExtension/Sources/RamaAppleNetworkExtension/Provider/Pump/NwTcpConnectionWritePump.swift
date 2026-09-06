@@ -6,6 +6,8 @@ import RamaAppleNEFFI
 final class NwTcpConnectionWritePump: @unchecked Sendable {
     private let connection: any NwConnectionLike
     private let core: TcpWritePumpCore
+    private let callbackQueue: DispatchQueue
+    private let callbackQueueKey = DispatchSpecificKey<UInt8>()
     /// Fired (on `core.queue`, at most once) when the pump hits a
     /// terminal write error. Symmetric to
     /// `TcpClientWritePump.onTerminalError`: the egress write pump
@@ -15,51 +17,41 @@ final class NwTcpConnectionWritePump: @unchecked Sendable {
     /// the egress is dead and wedges → flow leak. See
     /// `pumpCore(_:didTerminateWith:)`.
     private let onTerminal: @Sendable (Error) -> Void
-    /// Wall-clock cap on how long the egress NWConnection lingers after
-    /// the local side has sent its FIN (an empty `send` with
-    /// `isComplete: true`) before this pump force-cancels the
-    /// connection. A peer that fails to send its own FIN-ACK would
-    /// otherwise keep the kernel socket in FIN_WAIT_1 and the macOS
-    /// NECP flow registration alive — accumulating leaked
-    /// registrations is what makes new `nw_connection_start` calls
-    /// linearly slower on the workloop queue.
-    private let lingerCloseDeadline: DispatchTimeInterval
-    /// Scheduled linger-cancel work, retained so we can invalidate it
-    /// when the connection closes naturally before the deadline (or
-    /// when the pump is externally cancelled).
-    private var lingerWork: DispatchWorkItem?
-    /// Milliseconds since the flow last moved a byte, read on `core.queue`.
-    /// The linger watchdog consults this before force-cancelling: a FIN with
-    /// the read direction still streaming is a legitimate half-close, so it
-    /// re-arms while activity is recent and only cancels a quiet connection.
-    /// Default `.max` (always idle) keeps the plain bounded linger for
-    /// callers without a flow-activity clock.
-    private let readSideIdleMs: @Sendable () -> UInt64
-    /// `lingerCloseDeadline` in milliseconds, for comparison against
-    /// `readSideIdleMs()`.
-    private let lingerCloseMs: UInt64
+    /// One FIN submission result on the callback queue, before any owner teardown.
+    private let onFinComplete: @Sendable (Error?) -> Void
     /// Pending callback installed by
     /// `closeWhenDrained(_:)` — fires exactly once when the FIN
-    /// completes (success or local error), or from `deinit` as
+    /// completes (success or after reporting a local error), or
+    /// from `deinit` as
     /// a fallback if the pump is deallocated before drain has a
     /// chance to run. This guarantees a caller awaiting the FIN
     /// (e.g. `TcpDirectForwarder`) is never stranded.
     private var onDrainedCallback: (@Sendable () -> Void)?
+    /// Draining reached an empty queue while an established connection was
+    /// temporarily `.waiting`. Preserve the FIN intent until the session's
+    /// state handler observes recovery to `.ready`.
+    private var finWaitingForReady = false
+    /// Installed by the promoted natural-terminal path. It represents hard-cap
+    /// occupancy after registry removal and is released only when this pump
+    /// actually invokes `cancelAndDetach` (or observes it already did so).
+    private var terminalResourceRelease: (@Sendable () -> Void)?
+    private var connectionReleaseIssued = false
 
     init(
         connection: any NwConnectionLike,
         queue: DispatchQueue,
-        lingerCloseDeadline: DispatchTimeInterval,
         onDrained: @escaping @Sendable () -> Void,
         onTerminal: @escaping @Sendable (Error) -> Void = { _ in },
-        onActivity: @escaping @Sendable () -> Void = {},
-        readSideIdleMs: @escaping @Sendable () -> UInt64 = { .max }
+        onFinComplete: @escaping @Sendable (Error?) -> Void = { _ in },
+        onActivity: @escaping @Sendable () -> Bool = { true },
+        writerMemoryBudget: WriterMemoryBudget = WriterMemoryBudget(),
+        writePolicy: TcpWritePumpPolicy =
+            TcpWritePumpPolicy(maxPendingBytes: writePumpMaxPendingBytes)
     ) {
         self.connection = connection
-        self.lingerCloseDeadline = lingerCloseDeadline
-        self.lingerCloseMs = Self.millis(from: lingerCloseDeadline)
-        self.readSideIdleMs = readSideIdleMs
         self.onTerminal = onTerminal
+        self.onFinComplete = onFinComplete
+        self.callbackQueue = queue
         let core = TcpWritePumpCore(
             queue: queue,
             initialLifecycle: .open,
@@ -78,19 +70,31 @@ final class NwTcpConnectionWritePump: @unchecked Sendable {
             },
             logHwm: { hwm in
                 RamaLog.trace(
-                    "tcp egress write pump pendingBytes hwm=\(hwm) cap=\(writePumpMaxPendingBytes)"
+                    "tcp egress write pump pendingBytes hwm=\(hwm) cap=\(writePolicy.maxPendingBytes)"
                 )
             },
-            onActivity: onActivity
+            inlineWriteCompletionWhenOnQueue: true,
+            onActivity: onActivity,
+            writerMemoryBudget: writerMemoryBudget,
+            writePolicy: writePolicy
         )
         self.core = core
         core.delegate = self
+        queue.setSpecific(key: callbackQueueKey, value: 1)
     }
-
 
     /// Same status contract as `TcpClientWritePump.enqueue`.
     @discardableResult
     func enqueue(_ data: Data) -> RamaTcpDeliverStatusBridge { core.enqueue(data) }
+
+    @discardableResult
+    func enqueuePrecharged(_ payload: TcpPayloadSlice) -> RamaTcpDeliverStatusBridge {
+        core.enqueuePrecharged(payload)
+    }
+
+    var aggregateBudget: WriterMemoryBudget { core.aggregateBudget }
+
+    func retireAdmissionForEngineDetach() { core.retireAdmission() }
 
     /// Drain the queue, then send a FIN to the remote.
     ///
@@ -120,13 +124,8 @@ final class NwTcpConnectionWritePump: @unchecked Sendable {
                 return
             }
             if self.core.isClosed() {
-                // Core already closed: no FIN, so the linger watchdog that
-                // normally cancels the connection was never armed. In
-                // promoted mode `applyPromotedTerminal` delegates the cancel
-                // to this pump, so cancel here or the connection (and the
-                // graph anchored by its stateUpdateHandler) leaks. Safe — no
-                // FIN to clip on a closed core — and idempotent.
-                self.connection.cancelAndDetach()
+                // A closed writer cannot finish a FIN; release its connection now.
+                self.cancelConnectionAndReleaseLocked()
                 onDrained?()
                 return
             }
@@ -145,12 +144,8 @@ final class NwTcpConnectionWritePump: @unchecked Sendable {
         let coreCleanup = core.prepareCancel()
         core.queue.async { [weak self] in
             coreCleanup()
-            // External cancel makes any outstanding linger watchdog
-            // moot — its only job is to force-cancel a connection
-            // whose peer never closed, and that path has now been
-            // pre-empted.
-            self?.lingerWork?.cancel()
-            self?.lingerWork = nil
+            self?.finWaitingForReady = false
+
             // Fire any pending closeWhenDrained callback so a
             // caller waiting on FIN completion doesn't stall.
             if let cb = self?.onDrainedCallback {
@@ -160,61 +155,51 @@ final class NwTcpConnectionWritePump: @unchecked Sendable {
         }
     }
 
+    /// Call on the pump callback queue, as the promoted forwarder's terminal
+    /// callback does. A connection already force-cancelled by an earlier drain
+    /// or error path releases the new retirement token immediately.
+    func installTerminalResourceRelease(_ release: @escaping @Sendable () -> Void) {
+        dispatchPrecondition(condition: .onQueue(callbackQueue))
+        if connectionReleaseIssued {
+            release()
+            return
+        }
+        terminalResourceRelease = release
+    }
+
+    private func cancelConnectionAndReleaseLocked() {
+        if !connectionReleaseIssued {
+            connectionReleaseIssued = true
+            connection.cancelAndDetach()
+        }
+        let release = terminalResourceRelease
+        terminalResourceRelease = nil
+        release?()
+    }
+
     deinit {
         // Fallback: if the pump is deallocated before drain
         // completes, fire the callback so the caller's state
-        // machine isn't stranded. `deinit` runs synchronously
-        // on whichever thread releases the last strong ref —
-        // the callback contract doesn't promise a specific
-        // queue, but for safety the caller should treat it as
-        // "not necessarily on `core.queue`" and hop if needed.
+        // machine isn't stranded. `deinit` runs synchronously on whichever
+        // thread releases the last strong ref, so normalize this rare fallback
+        // onto the same queue as ordinary pump completions.
         if let cb = onDrainedCallback {
-            cb()
+            if DispatchQueue.getSpecific(key: callbackQueueKey) != nil {
+                cb()
+            } else {
+                callbackQueue.async(execute: cb)
+            }
         }
     }
 }
 
 extension NwTcpConnectionWritePump: TcpWritePumpCoreDelegate {
     internal func pumpCore(_ core: TcpWritePumpCore, didTerminateWith error: Error) {
-        // A terminal write error closes the core WITHOUT reaching
-        // `pumpCoreDidFinishDraining` — so no FIN is sent and no linger
-        // watchdog is armed. Two things must still happen, mirroring
-        // `TcpClientWritePump.pumpCore(_:didTerminateWith:)` and the
-        // `cancel()` path. Without them the promoted (`TcpDirectForwarder`)
-        // hot path leaks:
-        //
-        //  1. Fire any pending `closeWhenDrained` callback. The forwarder's
-        //     C→S `.finishing → .finished` transition is gated SOLELY on
-        //     this callback (`finishC2SLocked`). If it never fires the
-        //     forwarder wedges in `.finishing`, `onTerminal` never fires,
-        //     and the per-flow ctx — which strongly holds this pump — leaks
-        //     in the registry. `deinit` can't rescue it: the ctx is pinned
-        //     waiting for the very `.finished` this callback unblocks.
-        //
-        //  2. Force-cancel the connection so its NECP registration is
-        //     released. The FIN → linger watchdog sequence that normally
-        //     owns connection teardown is skipped on the error path, and
-        //     `fireTerminalLocked` deliberately does NOT cancel the
-        //     connection (it delegates to that watchdog). The nastiest
-        //     trigger makes this load-bearing: the transient-backpressure
-        //     retry hard-deadline (`TcpWritePumpCore`) terminates while the
-        //     NWConnection is still `.ready`, so the egress state handler
-        //     never observes `.failed`/`.cancelled` and there is NO other
-        //     teardown path. `cancelAndDetach` is idempotent and nils the
-        //     state handler, so it won't re-enter teardown and any later
-        //     cancel from `onTerminal` is a no-op.
-        //
-        // In `viaRust` mode `onDrainedCallback` is nil (the `onCloseEgress`
-        // hook calls `closeWhenDrained()` with no callback) so step 1 is a
-        // no-op there; the force-cancel is still correct — a terminal write
-        // error means the egress is broken/abandoned either way.
-        lingerWork?.cancel()
-        lingerWork = nil
-        connection.cancelAndDetach()
-        if let cb = onDrainedCallback {
-            onDrainedCallback = nil
-            cb()
-        }
+        // Release the connection and report failure before unblocking drain waiters.
+        finWaitingForReady = false
+        cancelConnectionAndReleaseLocked()
+        let drainCallback = onDrainedCallback
+        onDrainedCallback = nil
         // Drive the owner's teardown. In promoted mode the forwarder
         // owns the kernel flow + connection lifecycle; its C→S
         // direction can be parked indefinitely — blocked on a
@@ -228,91 +213,100 @@ extension NwTcpConnectionWritePump: TcpWritePumpCoreDelegate {
         // `TcpClientWritePump.onTerminalError`, the equivalent hook on
         // the sibling write pump.
         onTerminal(error)
+        // A drain waiter must still be released, but only AFTER errorful
+        // teardown has won. Otherwise the callback can complete the sibling
+        // drain pair as clean EOF and make `onTerminal(error)` a no-op.
+        drainCallback?()
     }
 
     internal func pumpCoreDidFinishDraining(_ core: TcpWritePumpCore) {
+        switch connection.state {
+        case .waiting(_):
+            // The session owns a bounded post-ready recovery timer. Do not
+            // turn a recoverable path blip into an immediate hard cancel just
+            // because the client half-closed during it.
+            finWaitingForReady = true
+            return
+        case .ready:
+            sendFinLocked()
+        default:
+            finishNonReadyDrainLocked()
+        }
+    }
+
+    /// Called by the owning session for a duplicate `.ready` transition after
+    /// an established connection recovered from `.waiting`.
+    func connectionBecameReady() {
+        let resume: @Sendable () -> Void = { [weak self] in
+            guard let self, self.finWaitingForReady else { return }
+            self.finWaitingForReady = false
+            guard self.connection.state == .ready else { return }
+            self.sendFinLocked()
+        }
+        if DispatchQueue.getSpecific(key: callbackQueueKey) != nil {
+            resume()
+        } else {
+            core.queue.async(execute: resume)
+        }
+    }
+
+    private func finishNonReadyDrainLocked() {
         // Snapshot the pending close-callback and clear the
-        // slot BEFORE issuing the FIN send. We capture `cb`
-        // strongly inside the `send` completion so the
-        // callback fires regardless of whether `self` is
-        // still alive when the completion lands.
+        // slot before force-cancelling the unusable connection.
         let cb = self.onDrainedCallback
         self.onDrainedCallback = nil
-        guard connection.state == .ready else {
-            // Can't FIN on a non-`.ready` connection (e.g. the path
-            // dropped to `.waiting`). The promoted terminal path
-            // (`TcpDirectForwarder.fireTerminalLocked`) delegates the
-            // NWConnection cancel to the linger watchdog armed below —
-            // which we skip in this branch — so force-cancel here.
-            // Otherwise the connection (and the `connection → session →
-            // ctx → connection` cycle + its NECP entry) leaks: a later
-            // duplicate `.ready` even disarms the state handler's
-            // tolerance teardown. `cancelAndDetach` is idempotent.
-            connection.cancelAndDetach()
-            cb?()
-            return
-        }
+        finWaitingForReady = false
+        cancelConnectionAndReleaseLocked()
+        cb?()
+    }
+
+    private func sendFinLocked() {
+        // Snapshot and clear before issuing the FIN. The send completion
+        // retains `cb`, so a concurrent owner teardown cannot strand it.
+        let cb = self.onDrainedCallback
+        self.onDrainedCallback = nil
+        finWaitingForReady = false
         // `.finalMessage` + `isComplete: true` is the documented way
         // to trigger a TCP half-close (FIN) on a `NWConnection`. Using
         // `.defaultMessage` only marks the logical message complete and
-        // leaves the stream open — the peer would never observe a
-        // half-close and the linger watchdog would have to escalate to
-        // a force-cancel. See
+        // leaves the stream open, so the peer would never observe a
+        // half-close. See
         // <https://developer.apple.com/documentation/network/nwconnection/contentcontext/finalmessage>.
+        let callbackQueue = self.callbackQueue
+        let callbackQueueKey = self.callbackQueueKey
+        let onFinComplete = self.onFinComplete
         connection.send(
             content: nil,
             contentContext: .finalMessage,
             isComplete: true,
-            completion: .contentProcessed({ _ in
-                // The FIN has been processed locally (queued
-                // for transmission). Fire the close-callback
-                // for the caller waiting on drain completion.
-                cb?()
+            completion: .contentProcessed({ [weak self] error in
+                // Preserve a FIN submission failure as a hard transport
+                // error. Notify the owner before releasing its drain waiter;
+                // otherwise the waiter can complete a clean two-sided drain
+                // and make the errorful teardown lose its one-shot race.
+                let finish: @Sendable () -> Void = { [weak self] in
+                    onFinComplete(error)
+                    if let error {
+                        self?.cancelConnectionAndReleaseLocked()
+                        self?.onTerminal(error)
+                    }
+                    cb?()
+                }
+                if DispatchQueue.getSpecific(key: callbackQueueKey) != nil {
+                    finish()
+                } else {
+                    callbackQueue.async(execute: finish)
+                }
             })
         )
-        // The FIN is queued. Schedule the linger watchdog so the
-        // NWConnection registration is released even if the peer
-        // never replies with its own FIN. `cancel()` is idempotent.
-        armLingerCancel(afterMs: lingerCloseMs)
     }
 
-    /// Arm (or re-arm) the linger force-cancel `afterMs` from now. At fire
-    /// time it re-arms while `readSideIdleMs()` shows recent activity (a
-    /// live half-close) and cancels only a quiet connection.
-    ///
-    /// Capture `connection` strongly: a promote teardown can drop the
-    /// per-flow ctx (and us with it) right after the FIN send completes —
-    /// `[weak self]` alone would no-op and leak the NWConnection. A gone
-    /// pump means the whole per-flow graph is gone and nothing can move
-    /// more bytes, so the cancel then proceeds unconditionally.
-    private func armLingerCancel(afterMs: UInt64) {
-        guard afterMs != .max else { return }  // `.never` deadline: no watchdog
-        let conn = connection
-        let work = DispatchWorkItem { [weak self] in
-            guard let self else {
-                conn.cancelAndDetach()
-                return
-            }
-            let idle = self.readSideIdleMs()
-            if idle < self.lingerCloseMs {
-                self.armLingerCancel(afterMs: max(self.lingerCloseMs - idle, 50))
-            } else {
-                conn.cancelAndDetach()
-                self.lingerWork = nil
-            }
-        }
-        lingerWork = work
-        core.queue.asyncAfter(deadline: .now() + .milliseconds(Int(afterMs)), execute: work)
-    }
-
-    private static func millis(from interval: DispatchTimeInterval) -> UInt64 {
-        switch interval {
-        case .seconds(let s): return s <= 0 ? 0 : UInt64(s) * 1_000
-        case .milliseconds(let ms): return ms <= 0 ? 0 : UInt64(ms)
-        case .microseconds(let us): return us <= 0 ? 0 : UInt64(us) / 1_000
-        case .nanoseconds(let ns): return ns <= 0 ? 0 : UInt64(ns) / 1_000_000
-        case .never: return .max
-        @unknown default: return UInt64(defaultLingerCloseMs)
+    /// Both directions have drained and the FIN completion has fired.
+    func releaseTerminalConnection() {
+        if DispatchQueue.getSpecific(key: callbackQueueKey) != nil {
+            cancelConnectionAndReleaseLocked()
+        } else {
+            core.queue.async { self.cancelConnectionAndReleaseLocked() }
         }
     }
 }

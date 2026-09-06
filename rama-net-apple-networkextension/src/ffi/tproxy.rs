@@ -248,6 +248,8 @@ pub struct TransparentProxyConfig {
     /// breaker, or missing session): `0` = Block, `1` = Passthrough (default).
     /// See [`tproxy::FlowRefusalAction`].
     pub flow_refusal_action: u32,
+    /// See [`tproxy::TransparentProxyConfig::live_flow_hard_cap`].
+    pub live_flow_hard_cap: u32,
 }
 
 #[repr(C)]
@@ -343,6 +345,7 @@ impl TransparentProxyConfig {
                 tproxy::FlowRefusalAction::Block => 0,
                 tproxy::FlowRefusalAction::Passthrough => 1,
             },
+            live_flow_hard_cap: config.live_flow_hard_cap(),
         }
     }
 
@@ -395,6 +398,11 @@ impl TransparentProxyConfig {
 ///   to the native log system of Apple, by Apple.
 /// * Callbacks may be invoked from any Tokio worker thread. The Swift caller
 ///   is responsible for any synchronization the pointee requires.
+/// * A callback must not synchronously call back into the same session. The
+///   engine holds a non-reentrant lifetime gate across dispatch, while foreign
+///   wrappers commonly serialize session entry through their own lock. Re-entry
+///   can therefore deadlock through lock inversion. Queue the work elsewhere
+///   and return from the callback first.
 /// * `BytesView` arguments are borrowed for the duration of the call and must
 ///   be copied before the callback returns if the receiver wants to retain
 ///   the data.
@@ -426,12 +434,20 @@ pub struct TransparentProxyTcpSessionCallbacks {
 /// `flow.writeDatagrams`. Peer may be marked absent
 /// (`UdpPeerView { present: false, .. }`) when the engine cannot
 /// supply attribution.
+/// The read-demand callback must only schedule the foreign read and return;
+/// it must never synchronously re-enter the session. For a non-zero probe ID,
+/// ACK that exact ID once the read completes, then submit its datagrams.
+/// Pre-ACK delivery is rejected and cannot consume the leased credit.
 #[repr(C)]
 pub struct TransparentProxyUdpSessionCallbacks {
     pub context: *mut c_void,
     pub on_server_datagram:
         Option<unsafe extern "C" fn(*mut c_void, BytesView, crate::ffi::UdpPeerView)>,
-    pub on_client_read_demand: Option<unsafe extern "C" fn(*mut c_void)>,
+    /// `probe_id == 0` is an ordinary service demand. A non-zero ID carries
+    /// one leased global-pressure scheduling credit which must be ACKed via
+    /// `rama_transparent_proxy_udp_session_on_client_read_complete` after the
+    /// foreign read completes and before its datagrams are submitted.
+    pub on_client_read_demand: Option<unsafe extern "C" fn(*mut c_void, u64)>,
     pub on_server_closed: Option<unsafe extern "C" fn(*mut c_void)>,
 }
 
@@ -566,18 +582,17 @@ pub struct TcpEgressConnectOptions {
     /// Whether `linger_close_ms` carries a meaningful value.
     /// `false` ⇒ Swift uses its built-in default.
     pub has_linger_close_ms: bool,
-    /// Wall-clock cap (milliseconds) on how long the egress
-    /// `NWConnection` is allowed to linger after the local side has
-    /// sent its FIN before the Swift side force-cancels it.
+    /// Grace (milliseconds) after a promoted flow reaches terminal before
+    /// Swift force-cancels its egress `NWConnection`.
     ///
     /// See [`crate::tproxy::NwTcpConnectOptions::linger_close_timeout`].
     pub linger_close_ms: u32,
     /// Whether `egress_eof_grace_ms` carries a meaningful value.
     /// `false` ⇒ Swift uses its built-in default.
     pub has_egress_eof_grace_ms: bool,
-    /// Grace window (milliseconds) between the egress read pump
-    /// observing peer EOF and the Swift side force-cancelling the
-    /// connection. See
+    /// Grace window (milliseconds) after an abnormal egress-read stop
+    /// before the Swift side force-cancels the connection. Clean peer
+    /// EOF does not arm this fallback. See
     /// [`crate::tproxy::NwTcpConnectOptions::egress_eof_grace`].
     pub egress_eof_grace_ms: u32,
     /// Enable TCP keepalive (`enableKeepalive`). No `has_` flag — always
@@ -653,7 +668,7 @@ pub struct TcpEgressConnectOptions {
 ///
 /// This is a Rust→Swift channel: Rust calls `on_promote_request`
 /// when the in-Rust service invokes [`crate::tproxy::PromoteHandle::into_passthrough`].
-/// Swift completes the cutover then ACKs by calling
+/// Swift queue-hops, returns from the callback, completes the cutover, then ACKs by calling
 /// `rama_transparent_proxy_tcp_session_confirm_promoted`.
 ///
 /// `context` lifetime / threading contract: see
@@ -885,6 +900,7 @@ mod tests {
             .with_flow_pressure_soft_cap(10)
             .with_flow_pressure_low_water(9)
             .with_flow_pressure_idle_floor_ms(8)
+            .with_live_flow_hard_cap(20)
             .with_tcp_start_in_flight_hard_cap(7)
             .with_tcp_start_in_flight_soft_cap(6)
             .with_tcp_start_latency_breaker_p95_ms(5)
@@ -1009,7 +1025,7 @@ mod tests {
         assert_eq!(offset_of!(FfiTransparentProxyNetworkRule, protocol), 44);
         assert_eq!(offset_of!(FfiTransparentProxyNetworkRule, exclude), 48);
 
-        assert_eq!(size_of::<TransparentProxyConfig>(), 80);
+        assert_eq!(size_of::<TransparentProxyConfig>(), 88);
         assert_eq!(offset_of!(TransparentProxyConfig, rules), 16);
         assert_eq!(
             offset_of!(TransparentProxyConfig, tcp_write_pump_max_pending_bytes),
@@ -1023,8 +1039,10 @@ mod tests {
             offset_of!(TransparentProxyConfig, tcp_breaker_connect_timeout_ms),
             72
         );
-        // Slots into the former tail padding, so `sizeof` stays 80.
         assert_eq!(offset_of!(TransparentProxyConfig, flow_refusal_action), 76);
+        // Appended for source compatibility; the eight-byte struct alignment
+        // rounds the new 84-byte payload up to 88 bytes.
+        assert_eq!(offset_of!(TransparentProxyConfig, live_flow_hard_cap), 80);
 
         assert_eq!(size_of::<FfiTransparentProxyInitConfig>(), 48);
         assert_eq!(
@@ -1127,6 +1145,7 @@ mod tests {
             .with_flow_pressure_soft_cap(11)
             .with_flow_pressure_low_water(12)
             .with_flow_pressure_idle_floor_ms(13)
+            .with_live_flow_hard_cap(20)
             .with_tcp_start_in_flight_hard_cap(14)
             .with_tcp_start_in_flight_soft_cap(15)
             .with_tcp_start_latency_breaker_p95_ms(16)
@@ -1138,6 +1157,7 @@ mod tests {
         assert_eq!(ffi.flow_pressure_soft_cap, 11);
         assert_eq!(ffi.flow_pressure_low_water, 12);
         assert_eq!(ffi.flow_pressure_idle_floor_ms, 13);
+        assert_eq!(ffi.live_flow_hard_cap, 20);
         assert_eq!(ffi.tcp_start_in_flight_hard_cap, 14);
         assert_eq!(ffi.tcp_start_in_flight_soft_cap, 15);
         assert_eq!(ffi.tcp_start_latency_breaker_p95_ms, 16);

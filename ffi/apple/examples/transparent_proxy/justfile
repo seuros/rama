@@ -3,7 +3,8 @@ set working-directory := '.'
 
 xcode_derived_data_dev := "./.xcode-derived/tproxy-app-dev"
 xcode_derived_data_dist := "./.xcode-derived/tproxy-app-dist"
-tproxy_built_app_dev := xcode_derived_data_dev + "/Build/Products/Debug/RamaTransparentProxyExampleContainer.app"
+xcode_configuration_dev := env_var_or_default("RAMA_TPROXY_CONFIGURATION", "Debug")
+tproxy_built_app_dev := xcode_derived_data_dev + "/Build/Products/" + xcode_configuration_dev + "/RamaTransparentProxyExampleContainer.app"
 tproxy_built_app_dist := xcode_derived_data_dist + "/Build/Products/Release/RamaTransparentProxyExampleContainer.app"
 
 [working-directory: './tproxy_rs']
@@ -23,48 +24,48 @@ install-tproxy-app-dev:
     ./scripts/build_tproxy_app_with_signing.sh
     INSTALLED_APP=/Applications/RamaTransparentProxyExampleContainer.app; \
     INSTALLED_SYSEXT="$INSTALLED_APP/Contents/Library/SystemExtensions/org.ramaproxy.example.tproxy.dev.provider.systemextension"; \
-    ./scripts/install_tproxy_app_bundle.sh dev "{{tproxy_built_app_dev}}" 0; \
+    ./scripts/install_tproxy_app_bundle.sh dev "{{tproxy_built_app_dev}}" 0 && \
     echo "Installed Development system extension bundle at $INSTALLED_SYSEXT"
 
 install-tproxy-app-dist:
     ./scripts/notarize_tproxy_app_with_developer_id_signing.sh
     INSTALLED_APP=/Applications/RamaTransparentProxyExampleContainer.app; \
-    INSTALLED_SYSEXT="$INSTALLED_APP/Contents/Library/SystemExtensions/org.ramaproxy.example.tproxy.provider.systemextension"; \
-    ./scripts/install_tproxy_app_bundle.sh dist "{{tproxy_built_app_dist}}" 0; \
+    INSTALLED_SYSEXT="$INSTALLED_APP/Contents/Library/SystemExtensions/org.ramaproxy.example.tproxy.dist.provider.systemextension"; \
+    ./scripts/install_tproxy_app_bundle.sh dist "{{tproxy_built_app_dist}}" 0 && \
     echo "Installed Developer ID system extension bundle at $INSTALLED_SYSEXT"
 
 install-tproxy-app-dev-reset-profile:
     ./scripts/build_tproxy_app_with_signing.sh
     INSTALLED_APP=/Applications/RamaTransparentProxyExampleContainer.app; \
     INSTALLED_SYSEXT="$INSTALLED_APP/Contents/Library/SystemExtensions/org.ramaproxy.example.tproxy.dev.provider.systemextension"; \
-    ./scripts/install_tproxy_app_bundle.sh dev "{{tproxy_built_app_dev}}" 1; \
+    ./scripts/install_tproxy_app_bundle.sh dev "{{tproxy_built_app_dev}}" 1 && \
     echo "Installed Development system extension bundle at $INSTALLED_SYSEXT"
 
 install-tproxy-app-dist-reset-profile:
     ./scripts/notarize_tproxy_app_with_developer_id_signing.sh
     INSTALLED_APP=/Applications/RamaTransparentProxyExampleContainer.app; \
-    INSTALLED_SYSEXT="$INSTALLED_APP/Contents/Library/SystemExtensions/org.ramaproxy.example.tproxy.provider.systemextension"; \
-    ./scripts/install_tproxy_app_bundle.sh dist "{{tproxy_built_app_dist}}" 1; \
+    INSTALLED_SYSEXT="$INSTALLED_APP/Contents/Library/SystemExtensions/org.ramaproxy.example.tproxy.dist.provider.systemextension"; \
+    ./scripts/install_tproxy_app_bundle.sh dist "{{tproxy_built_app_dist}}" 1 && \
     echo "Installed Developer ID system extension bundle at $INSTALLED_SYSEXT"
 
-build-tproxy-dev: build-tproxy-rs build-tproxy-app-dev
+build-tproxy-dev: build-tproxy-app-dev
 
-build-tproxy-dist: build-tproxy-rs build-tproxy-app-dist
+build-tproxy-dist: build-tproxy-app-dist
 
 build-tproxy: build-tproxy-dev build-tproxy-dist
 
-notarize-tproxy-dist: build-tproxy-rs notarize-tproxy-app-dist
+notarize-tproxy-dist: notarize-tproxy-app-dist
 
 clear-tproxy-files:
-    sudo rm -rf /var/root/Library/Application Support/rama/tproxy/dial9-traces
+    sudo rm -rf "/var/root/Library/Application Support/rama/tproxy/dial9-traces"
 
-install-tproxy-dev: build-tproxy-rs clear-tproxy-files install-tproxy-app-dev
+install-tproxy-dev: clear-tproxy-files install-tproxy-app-dev
 
-install-tproxy-dev-reset-profile: build-tproxy-rs install-tproxy-app-dev-reset-profile
+install-tproxy-dev-reset-profile: install-tproxy-app-dev-reset-profile
 
-install-tproxy-dist: build-tproxy-rs clear-tproxy-files install-tproxy-app-dist
+install-tproxy-dist: clear-tproxy-files install-tproxy-app-dist
 
-install-tproxy-dist-reset-profile: build-tproxy-rs install-tproxy-app-dist-reset-profile
+install-tproxy-dist-reset-profile: install-tproxy-app-dist-reset-profile
 
 clean: clean-rust clean-swift clean-xcode
 
@@ -149,15 +150,26 @@ run-tproxy-ffi-e2e-swift: build-tproxy-rs-debug
         -Xlinker -framework -Xlinker NetworkExtension \
         -Xlinker -framework -Xlinker SystemConfiguration
 
-# Swift unit tests under ThreadSanitizer. The suppressions file silences known
-# TEST-HARNESS races only (tests observing flowQueue-confined ctx state from the
-# test thread; ChaosTests' deliberate raw-thread teardown idempotency probe) —
-# every suppressed function is single-threaded in production, so a REAL
-# production data race would be in a different function and still fail this. See
-# the file header in RamaAppleNetworkExtension/tsan-suppressions.txt.
+# First compile the ordinary uninstrumented Release products. The optimized
+# test suite then explicitly enables the existing state/scheduling observation
+# seams without defining DEBUG or enabling Swift debug assertions. Production
+# Release app builds omit RAMA_TESTING and keep those seams compiled out.
+[working-directory: '.']
+run-tproxy-ffi-e2e-swift-release: build-tproxy-rs-debug
+    swift build -c release
+    swift test -c release -Xswiftc -DRAMA_TESTING \
+        -Xlinker -L$(pwd)/tproxy_rs/target/debug \
+        -Xlinker -lrama_tproxy_example \
+        -Xlinker -lz \
+        -Xlinker -framework -Xlinker NetworkExtension \
+        -Xlinker -framework -Xlinker SystemConfiguration
+
+# Full Swift unit suite under ThreadSanitizer. Suppressions are deliberately
+# forbidden: any reported Swift-side race must fail this recipe. The linked
+# Rust static library is not instrumented by this Swift TSan invocation.
 [working-directory: '.']
 run-tproxy-ffi-e2e-swift-tsan: build-tproxy-rs-debug
-    TSAN_OPTIONS="suppressions=$(pwd)/../../RamaAppleNetworkExtension/tsan-suppressions.txt" \
+    TSAN_OPTIONS="halt_on_error=1:exitcode=66" \
     swift test --sanitize=thread \
         -Xlinker -L$(pwd)/tproxy_rs/target/debug \
         -Xlinker -lrama_tproxy_example \
@@ -170,53 +182,48 @@ qa-rust: sort clippy rust-doc rust-test rust-test-ignored
 check-spec-parity:
     ./scripts/check_spec_parity.sh
 
-qa: qa-rust check-spec-parity build-tproxy-dev
+lint-scripts:
+    shellcheck ./scripts/*.sh
+
+test-tools: lint-scripts
+    python3 ./scripts/test_tools.py
+
+qa: qa-rust check-spec-parity test-tools build-tproxy-dev
 
 test-e2e: build-tproxy-rs-debug clippy-tproxy-ffi-e2e cleanup-tproxy-ffi-e2e run-tproxy-ffi-e2e run-tproxy-ffi-e2e-swift
 
-# Real signed-system-extension E2E (macOS 15+). Builds and installs the dev
-# app, supplies non-persisted test-only UDP policy start options, and proves
-# transparent pass-through (`false`), provider forwarding (`true`), and block
-# (`true`) against public protocol endpoints, including HTTP/3 on UDP/443.
-# Requires Internet access, Apple Development signing, and sysext approval.
-test-modern-udp-signed: build-tproxy-rs build-tproxy-app-dev
-    ./scripts/test_modern_udp_flow.sh "{{tproxy_built_app_dev}}"
-
 test-full: qa test-e2e
 
-# Run the FFI e2e suite under AddressSanitizer to surface UAF / data races.
+# Run the Rust FFI e2e suite under AddressSanitizer to surface memory errors,
+# including use-after-free. ASan does not detect data races.
 #
 # Requires nightly Rust (`rustup toolchain install nightly`). The static lib
 # (`tproxy_rs`) and the test crate (`tproxy_ffi_e2e`) must both be built with
-# the sanitizer flag — otherwise instrumentation is incomplete and races slip
-# past. See the `cases::stress::*` tests for the high-churn scenarios that
-# give the sanitizer enough race windows to land on a real bug.
+# the sanitizer flag, otherwise memory accesses across that boundary are not
+# fully instrumented. Run every FFI case, including the UDP ownership,
+# backpressure, and 8,192-session cases as well as the churn scenarios.
+# Disable the example's default jemalloc feature so allocator symbols agree
+# with the test driver and ASan intercepts heap allocation and deallocation.
 [working-directory: './tproxy_rs']
 build-tproxy-rs-asan:
     RUSTFLAGS="-Z sanitizer=address -D warnings --cfg tokio_unstable" \
-        cargo +nightly build --target aarch64-apple-darwin
+        cargo +nightly build --locked --no-default-features --target-dir target/asan --target aarch64-apple-darwin
 
 [working-directory: './tproxy_ffi_e2e']
 run-tproxy-ffi-e2e-asan:
     RUSTFLAGS="-Z sanitizer=address -D warnings --cfg tokio_unstable" \
-        RAMA_TPROXY_EXAMPLE_LIB_DIR="../tproxy_rs/target/aarch64-apple-darwin/debug" \
-        cargo +nightly test --target aarch64-apple-darwin \
-        --test e2e -- --test-threads=1 --nocapture cases::stress
+        RAMA_TPROXY_EXAMPLE_LIB_DIR="../tproxy_rs/target/asan/aarch64-apple-darwin/debug" \
+        cargo +nightly test --target-dir target/asan --target aarch64-apple-darwin \
+        --test e2e -- --test-threads=1 --nocapture
 
 # Convenience target: build the staticlib with ASan and run the e2e stress
 # cases under it. Slower than `test-e2e` and requires nightly.
 test-e2e-asan: build-tproxy-rs-asan run-tproxy-ffi-e2e-asan
 
-# Convenience target for the two sanitizer passes that exercise the Swift/C/Rust
-# transparent-proxy bridge: Rust ASan stress cases plus Swift ThreadSanitizer.
+# Complementary sanitizer passes: Rust ASan memory-safety stress plus Swift-side
+# TSan. This does not provide TSan race coverage for the linked Rust staticlib.
 test-e2e-sanitizers: test-e2e-asan run-tproxy-ffi-e2e-swift-tsan
 
-# Generate live traffic against public HTTP/HTTPS endpoints to stress
-# the running sysext. Mixes small/large GET, large POST, parallel
-# connections, plain HTTP, and HTTP/1.1 ↔ HTTP/2. The sysext must be
-# installed and active. Tune via STRESS_DURATION /
-# STRESS_CONCURRENCY etc; with `MONITOR_PID=$(pgrep -f
-# org.ramaproxy.example.tproxy.dev.provider)` it also samples the
-# extension's RSS / VM regions / leaks every 5s.
+# Generate HTTP traffic through the running proxy; use --help for workload options.
 stress-traffic *ARGS:
-    bash ./scripts/stress_traffic.sh {{ARGS}}
+    python3 ./scripts/stress_traffic.py {{ARGS}}

@@ -21,9 +21,9 @@ import XCTest
 ///   * **Idempotency** — first variant wins; every subsequent
 ///     call (any variant) is a no-op.
 ///   * **Pre-open variants** (`applyPreReadyFailure`,
-///     `applyConnectTimeout`) leave the kernel flow alone —
-///     the flow was never opened, calling `closeReadWithError`
-///     on an un-opened flow is a contract violation.
+///     `applyConnectTimeout`) reject both halves exactly once —
+///     the provider already claimed the flow, so dropping it unopened
+///     would strand the originating connect.
 ///   * **Drained-close variant** distinguishes
 ///     `wasOpened: true` (close with `nil`, a clean EOF) from
 ///     `wasOpened: false` (close with `upstreamUnavailable`).
@@ -89,6 +89,45 @@ final class TcpFlowTeardownTests: XCTestCase {
         XCTAssertEqual(fx.flow.closeWriteCallCount, 1)
         XCTAssertEqual(
             fx.conn.cancelCount, 1, "subsequent teardowns must not re-cancel the connection")
+    }
+
+    func testWriterTerminalSynchronouslyClosesBothWriterPumps() {
+        let fx = Fixture()
+        let queue = DispatchQueue(label: "rama.test.writer-terminal")
+        let clientWriter = TcpClientWritePump(
+            flow: fx.flow,
+            queue: queue,
+            logger: { _ in },
+            onTerminalError: { _ in },
+            onDrained: {})
+        let egressWriter = NwTcpConnectionWritePump(
+            connection: fx.conn,
+            queue: queue,
+            onDrained: {})
+        fx.ctx.clientWritePump = clientWriter
+        fx.ctx.egressWritePump = egressWriter
+
+        fx.ctx.applyWriterTerminal(NSError(domain: "test.writer", code: 1))
+
+        XCTAssertEqual(clientWriter.enqueue(Data([0x01])), .closed)
+        XCTAssertEqual(egressWriter.enqueue(Data([0x02])), .closed)
+        queue.sync {}
+        XCTAssertTrue(fx.flow.writes.isEmpty)
+        XCTAssertTrue(fx.conn.sentChunks.isEmpty)
+    }
+
+    func testFullTeardownDoesNotRepeatAnAlreadyClosedHalf() {
+        let fx = Fixture()
+        let first = NSError(domain: "test.first-write-close", code: 7)
+        let later = NSError(domain: "test.later-flow-error", code: 9)
+
+        fx.ctx.closeClientWriteOnce(first)
+        fx.ctx.applyWriterTerminal(later)
+
+        XCTAssertEqual(fx.flow.closeWriteCallCount, 1)
+        XCTAssertEqual((fx.flow.lastCloseWriteError as NSError?)?.domain, first.domain)
+        XCTAssertEqual(fx.flow.closeReadCallCount, 1)
+        XCTAssertEqual((fx.flow.lastCloseReadError as NSError?)?.domain, later.domain)
     }
 
     // MARK: - Pre-open variants

@@ -20,11 +20,13 @@ final class MockUdpFlow: UdpFlowLike, @unchecked Sendable {
 
     private let lock = NSLock()
     private var _pendingReads: [ReadCompletion] = []
+    private var _readInvocationUptimeNanoseconds: [UInt64] = []
     private var _writtenBatches: [WrittenBatch] = []
     private var _pendingOpenCompletion: OpenCompletion?
     private var _openLocalEndpoint: NWHostEndpoint??
     private var _closeReadErrors: [Error?] = []
     private var _closeWriteErrors: [Error?] = []
+    private var _writeAfterCloseCount: Int = 0
     private var _applyMetadataCount: Int = 0
 
     // MARK: - UdpFlowLike
@@ -33,6 +35,7 @@ final class MockUdpFlow: UdpFlowLike, @unchecked Sendable {
         completionHandler: @escaping @Sendable ([Data]?, [NWEndpoint]?, Error?) -> Void
     ) {
         lock.lock()
+        _readInvocationUptimeNanoseconds.append(DispatchTime.now().uptimeNanoseconds)
         _pendingReads.append(completionHandler)
         lock.unlock()
     }
@@ -43,6 +46,9 @@ final class MockUdpFlow: UdpFlowLike, @unchecked Sendable {
         completionHandler: @escaping @Sendable (Error?) -> Void
     ) {
         lock.lock()
+        if !_closeWriteErrors.isEmpty {
+            _writeAfterCloseCount += 1
+        }
         _writtenBatches.append(
             WrittenBatch(datagrams: datagrams, sentBy: remoteEndpoints, completion: completionHandler)
         )
@@ -129,6 +135,15 @@ final class MockUdpFlow: UdpFlowLike, @unchecked Sendable {
         return _pendingReads.count
     }
 
+    /// Callback-entry witness for linked pressure tests. Recording happens in
+    /// `readDatagrams` itself, after Rust's C callback and the production
+    /// `UdpFlowSession` queue hop, so the assertion is independent of when the
+    /// XCTest thread resumes to observe `pendingReadCount`.
+    var readInvocationUptimeNanoseconds: [UInt64] {
+        lock.lock(); defer { lock.unlock() }
+        return _readInvocationUptimeNanoseconds
+    }
+
     var writtenBatches: [WrittenBatch] {
         lock.lock(); defer { lock.unlock() }
         return _writtenBatches
@@ -147,6 +162,16 @@ final class MockUdpFlow: UdpFlowLike, @unchecked Sendable {
     var closeWriteCallCount: Int {
         lock.lock(); defer { lock.unlock() }
         return _closeWriteErrors.count
+    }
+
+    var lastCloseWriteError: Error? {
+        lock.lock(); defer { lock.unlock() }
+        return _closeWriteErrors.last ?? nil
+    }
+
+    var writeAfterCloseCount: Int {
+        lock.lock(); defer { lock.unlock() }
+        return _writeAfterCloseCount
     }
 
     var applyMetadataCallCount: Int {

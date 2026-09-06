@@ -6,12 +6,12 @@ import XCTest
 
 /// Cross-pump interaction tests for the egress side of a TCP session.
 ///
-/// The linger-cancel watchdog and the EOF backstop in the read pump are
+/// The terminal-release watchdog and hard-stop fallback in the read pump are
 /// each tested in isolation by their own suites. The bugs that
 /// actually showed up in the field, though, came from the
 /// *interaction* between the two pumps and the NWConnection
 /// state machine — a
-/// connection that lingered after FIN AND then peer-EOFed mid-linger,
+/// connection whose pumps terminate along different paths,
 /// for example, has to leave nothing leaked regardless of which
 /// backstop fires first.
 ///
@@ -81,10 +81,8 @@ final class TcpEgressPumpInteractionTests: XCTestCase {
 
     // MARK: - Drain + peer EOF interaction
 
-    /// Local FIN sent, then peer EOF arrives before the linger
-    /// watchdog fires. The expected end state: connection cancelled
-    /// (by one of the backstops), pumps both off, no orphan timer
-    /// outstanding. Pump cancel must invalidate both watchdogs.
+    /// Local FIN sent, then peer EOF arrives. Neither half-close alone starts
+    /// the terminal grace. External pump cancellation must leave no timer.
     func testDrainThenPeerEofBeforeLinger() {
         let engine = makeEngine()
         defer { engine.stop(reason: 0) }
@@ -96,7 +94,6 @@ final class TcpEgressPumpInteractionTests: XCTestCase {
         let writePump = NwTcpConnectionWritePump(
             connection: mock,
             queue: queue,
-            lingerCloseDeadline: .milliseconds(600),
             onDrained: {}
         )
         let readPump = NwTcpConnectionReadPump(
@@ -112,10 +109,8 @@ final class TcpEgressPumpInteractionTests: XCTestCase {
         XCTAssertEqual(mock.sentChunks.count, 1, "FIN should have been sent")
         XCTAssertEqual(mock.cancelCount, 0, "no watchdog should have fired yet")
 
-        // Simulate peer EOF on the read side. The read pump will fire
-        // session.onEgressEof() and schedule the EOF backstop. Both
-        // backstops (linger from the write side, EOF from the read
-        // side) are now armed.
+        // Peer EOF is also a legal half-close at the pump level. The owner
+        // composes both directions and arms terminal release when appropriate.
         mock.completePendingReceive(isComplete: true)
         waitForQueueDrain(queue)
 
@@ -135,12 +130,12 @@ final class TcpEgressPumpInteractionTests: XCTestCase {
         )
     }
 
-    /// Local FIN sent, neither pump externally cancelled, linger
-    /// watchdog and EOF backstop both armed but they race. At least
+    /// Local FIN sent, then an egress read error, so both hard-stop
+    /// watchdogs are armed and race. At least
     /// one must fire and at most two cancels are expected (one per
     /// backstop — both call `cancel()` which is idempotent on a
     /// real NWConnection, but the mock counts every call).
-    func testRacingBackstopsBothCancel() {
+    func testRacingHardStopBackstopsBothCancel() {
         let engine = makeEngine()
         defer { engine.stop(reason: 0) }
         let session = makeInterceptedSession(engine)
@@ -151,7 +146,6 @@ final class TcpEgressPumpInteractionTests: XCTestCase {
         let writePump = NwTcpConnectionWritePump(
             connection: mock,
             queue: queue,
-            lingerCloseDeadline: .milliseconds(200),
             onDrained: {}
         )
         let readPump = NwTcpConnectionReadPump(
@@ -163,7 +157,10 @@ final class TcpEgressPumpInteractionTests: XCTestCase {
 
         readPump.start()
         writePump.closeWhenDrained()
-        mock.completePendingReceive(isComplete: true)
+        writePump.releaseTerminalConnection()
+        mock.completePendingReceive(
+            isComplete: false,
+            error: NWError.posix(.ECONNRESET))
         waitForQueueDrain(queue)
         // No pre-assert that cancelCount == 0 here: under heavy parallel-test
         // load the setup above can itself take >200 ms, so a backstop may have
@@ -212,7 +209,6 @@ final class TcpEgressPumpInteractionTests: XCTestCase {
             let writePump = NwTcpConnectionWritePump(
                 connection: mock,
                 queue: queue,
-                lingerCloseDeadline: .milliseconds(50),
                 onDrained: {}
             )
             let readPump = NwTcpConnectionReadPump(
@@ -262,7 +258,6 @@ final class TcpEgressPumpInteractionTests: XCTestCase {
             let writePump = NwTcpConnectionWritePump(
                 connection: mock,
                 queue: queue,
-                lingerCloseDeadline: .milliseconds(100),
                 onDrained: {}
             )
             let readPump = NwTcpConnectionReadPump(
@@ -276,7 +271,10 @@ final class TcpEgressPumpInteractionTests: XCTestCase {
 
             readPump.start()
             writePump.closeWhenDrained()
-            mock.completePendingReceive(isComplete: true)
+            writePump.releaseTerminalConnection()
+            mock.completePendingReceive(
+                isComplete: false,
+                error: NWError.posix(.ECONNRESET))
             waitForQueueDrain(queue)
 
             // Wait past both deadlines so both watchdogs fire.
@@ -293,10 +291,9 @@ final class TcpEgressPumpInteractionTests: XCTestCase {
         XCTAssertNil(weakReadPump, "read pump retained past watchdog fire — watchdog work item leak")
     }
 
-    /// Peer EOF arms the read pump's EOF-grace force-cancel; a promote
-    /// cutover landing inside that grace window must disarm it, or the stale
-    /// timer cancels the connection under the new forwarder's feet.
-    func testCancelForPromoteDisarmsArmedEofGraceBackstop() {
+    /// A dropped Rust egress consumer arms the read pump's force-cancel; a
+    /// promote cutover landing inside that grace window must disarm it.
+    func testCancelForPromoteDisarmsArmedHardStopBackstop() {
         let engine = makeEngine()
         defer { engine.stop(reason: 0) }
         let session = makeInterceptedSession(engine)
@@ -319,12 +316,12 @@ final class TcpEgressPumpInteractionTests: XCTestCase {
         // completing it, or the EOF is silently dropped and the pump never
         // reaches `.closed`.
         waitForQueueDrain(queue)
-        // Peer EOF: phase → .closed, EOF-grace backstop armed.
-        mock.completePendingReceive(isComplete: true)
+        session.cancel()
+        mock.completePendingReceive(data: Data([0x01]), isComplete: false)
         waitForQueueDrain(queue)
         XCTAssertTrue(
             queue.sync { readPump.isEofBackstopArmed },
-            "peer EOF must arm the backstop before the promote disarms it")
+            "dropped Rust consumer must arm before promote disarms it")
 
         let done = expectation(description: "cancelForPromote completed")
         readPump.cancelForPromote(onCarryover: { _ in }, onComplete: { done.fulfill() })

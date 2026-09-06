@@ -8,7 +8,7 @@ use rama_net::address::{
 };
 use rama_utils::{
     macros::generate_set_and_with,
-    octets::kib,
+    octets::{kib, mib},
     str::{NonEmptyStr, arcstr::ArcStr},
 };
 
@@ -21,11 +21,26 @@ const MIN_TCP_WRITE_PUMP_MAX_PENDING_BYTES: usize = 1;
 /// Largest accepted TCP write-pump cap, per pump. Two TCP pumps can
 /// exist per flow, so this caps worst-case write-side buffering at
 /// 16 MiB per flow while still leaving room for bursty protocols.
-const MAX_TCP_WRITE_PUMP_MAX_PENDING_BYTES: usize = kib(8192);
+const MAX_TCP_WRITE_PUMP_MAX_PENDING_BYTES: usize = mib(8);
+
+/// Core/process-lifetime Swift retained-payload envelope. The packed C11
+/// atomic reserves 40 bits for bytes and 23 bits for retained items; keep Rust
+/// configuration inside that exact wire representation.
+pub const DEFAULT_WRITER_MEMORY_MAX_BYTES: usize = mib(64);
+pub const DEFAULT_WRITER_MEMORY_MAX_ITEMS: usize = 65_536;
+pub const WRITER_MEMORY_UDP_SERVICE_RESERVE_BYTES: usize = kib(64);
+pub const MAX_WRITER_MEMORY_MAX_BYTES: usize = ((1_u64 << 40) - 1) as usize;
+pub const MAX_WRITER_MEMORY_MAX_ITEMS: usize = (1_usize << 23) - 1;
+const MIN_WRITER_MEMORY_MAX_BYTES: usize =
+    MAX_TCP_WRITE_PUMP_MAX_PENDING_BYTES + WRITER_MEMORY_UDP_SERVICE_RESERVE_BYTES + kib(64);
+const MIN_WRITER_MEMORY_MAX_ITEMS: usize = 256;
 
 /// Default combined TCP+UDP live-flow soft cap that triggers the Swift-side
 /// idle TCP pressure reaper.
 pub const DEFAULT_FLOW_PRESSURE_SOFT_CAP: u32 = 450;
+/// Default combined TCP+UDP live-flow hard cap. This is a final admission
+/// backstop below the observed kernel nexus exhaustion edge (~600 flows).
+pub const DEFAULT_LIVE_FLOW_HARD_CAP: u32 = 500;
 /// Default target live-flow count after a pressure reap.
 pub const DEFAULT_FLOW_PRESSURE_LOW_WATER: u32 = 350;
 /// Default minimum idle age before a TCP flow is eligible for pressure reaping.
@@ -213,25 +228,18 @@ pub struct NwTcpConnectOptions {
     pub parameters: NwEgressParameters,
     /// Maps to `NWProtocolTCP.Options.connectionTimeout`.
     pub connect_timeout: Option<Duration>,
-    /// Wall-clock cap on how long the egress `NWConnection` is allowed
-    /// to linger after the local side has sent its FIN (an empty `send`
-    /// with `isComplete: true`). When the peer fails to respond with
-    /// its own FIN within this window the Swift side force-cancels the
-    /// connection, releasing the macOS NECP flow registration that
-    /// would otherwise keep the socket pinned in FIN_WAIT_1. `None`
-    /// falls back to the Swift-side default (currently 5 seconds).
+    /// Grace after a promoted flow reaches terminal before Swift
+    /// force-cancels its egress `NWConnection`. A successful local FIN alone
+    /// does not start this window because the response half may legally remain
+    /// quiet. `None` falls back to the Swift-side default (currently 5 seconds).
     pub linger_close_timeout: Option<Duration>,
-    /// Grace window between the egress read pump observing peer EOF
-    /// (or a read error) and the Swift side force-cancelling the
-    /// connection. The clean teardown path runs `on_egress_eof` →
-    /// Rust bridge exits → `on_server_closed` → Swift cancels the
-    /// connection, which depends on the originating app's write pump
-    /// being able to drain. When the app has stopped reading (process
-    /// exit, browser tab closed) the drain never completes and the
-    /// clean path stalls indefinitely. This backstop ensures the
-    /// `NWConnection` is cancelled within a bounded time after the
-    /// upstream EOF regardless of app behavior. `None` falls back to
-    /// the Swift-side default (currently 2 seconds).
+    /// Grace window for abnormal egress-read termination: a read error,
+    /// a vanished Swift session, or Rust dropping its egress consumer.
+    /// It bounds how long the `NWConnection` may remain registered when
+    /// the normal close path cannot run. A clean server→client EOF does
+    /// not arm this short fallback because the client→server half may
+    /// legally remain quiet and resume later. `None` falls back to the
+    /// Swift-side default (currently 2 seconds).
     pub egress_eof_grace: Option<Duration>,
     /// Enable TCP keepalive on the egress `NWConnection`. **Defaults to
     /// `true`** ([`Self::default`]): the transport-layer self-heal for a
@@ -644,20 +652,21 @@ impl TransparentProxyNetworkRule {
 }
 
 /// How the provider treats a flow it declines to intercept for its OWN reasons
-/// — the pre-ready TCP start hard cap / latency breaker tripping, or a missing /
-/// invalid session — as distinct from a [`crate::tproxy::FlowAction::Blocked`]
-/// your handler returns. The chosen action is always logged at the decision
-/// site.
+/// — decision-concurrency saturation, the pre-ready TCP start hard cap /
+/// latency breaker tripping, or a missing / invalid session — as distinct from
+/// a [`crate::tproxy::FlowAction::Blocked`] your handler returns. The chosen
+/// action is always logged at the decision site.
 ///
 /// Default [`Passthrough`](Self::Passthrough) (fail open). These refusals are
-/// capacity decisions, not policy: the flow is one the handler WOULD have
-/// intercepted, and the direct route still exists. Declining hands it to that
-/// route per the transparent-provider contract (see the crate-level `tproxy`
-/// docs) — the same path every policy-passthrough flow already takes, so it
-/// adds no new exposure class. Blocking instead turns a transient overload into
-/// hard connect errors for every app on the machine, and a client retry storm
-/// (the usual reaction to those errors) then feeds the very overload that
-/// caused them.
+/// capacity decisions, not policy: at decision-concurrency saturation the
+/// handler verdict is not yet known; at later admission sites the handler has
+/// already chosen interception. In both cases the direct route still exists.
+/// Declining hands the flow to that route per the transparent-provider
+/// contract (see the crate-level `tproxy` docs) — the same path every
+/// policy-passthrough flow already takes. Blocking instead turns a transient
+/// overload into hard connect errors for every app on the machine, and a
+/// client retry storm (the usual reaction to those errors) then feeds the very
+/// overload that caused them.
 ///
 /// Set [`Block`](Self::Block) only where an uninspected flow is worse than no
 /// flow AND you accept a machine-wide outage under load as the cost.
@@ -687,28 +696,41 @@ impl std::fmt::Display for FlowRefusalAction {
 pub struct TransparentProxyConfig {
     tunnel_remote_address: ArcStr,
     rules: Vec<TransparentProxyNetworkRule>,
-    /// Per-flow TCP write-pump back-pressure cap in bytes. The Swift pump
-    /// enqueues bytes up to this limit; once exceeded it signals `.paused`
-    /// to the Rust bridge so the ingress side stops reading until the queue
-    /// drains below the cap. Defaults to 256 KiB (262,144 bytes) — two
-    /// pumps per flow ⇒ 512 KiB worst-case write-side per flow, sized for
-    /// the common many-concurrent-flows / modest-per-flow-throughput shape.
+    /// Per-flow TCP write-pump queue cap in bytes. The Swift pump enqueues
+    /// bytes up to this limit; once exceeded it signals `.paused` to the Rust
+    /// bridge so the ingress side stops writing until the queue drains below
+    /// the cap. Rust also limits every borrowed Swift sink callback to no more
+    /// than this value (and normally to the engine's smaller 16 KiB bridge
+    /// chunk default), so one large service write cannot bypass the bound.
+    /// Defaults to 256 KiB (262,144 bytes). Queued and serialized in-flight
+    /// callbacks share this budget; the in-flight chunk remains charged until
+    /// Network.framework releases it.
     ///
     /// Lowering this value reduces peak per-flow memory at the cost of
     /// slightly more frequent pause/resume cycles; raising it helps absorb
     /// bursty producers (e.g. h2 window-sized bursts) without pausing.
     ///
-    /// The Swift pump treats this as authoritative — there is no
-    /// "0 means unset" path. The value the engine emits is the value the
-    /// pump uses.
+    /// The Swift pump treats the effective getter as authoritative — there is
+    /// no "0 means unset" path. It stays at least 64 KiB below the aggregate
+    /// payload cap so one TCP waiter cannot black-hole UDP/QUIC/H3 replies.
     tcp_write_pump_max_pending_bytes: usize,
+    /// Exact core/process-lifetime envelope shared by every Swift TCP/UDP
+    /// writer and retained TCP replay/cutover buffer. Engine replacement
+    /// reconfigures the same object, so retiring generations cannot stack caps.
+    writer_memory_max_bytes: usize,
+    writer_memory_max_items: usize,
     /// Combined TCP+UDP live-flow soft cap that triggers Swift's idle TCP
     /// pressure reaper. `0` disables this established-flow pressure reaper.
+    /// When both flow caps are enabled, the Apple provider bounds the effective
+    /// soft cap by the live-flow hard cap at its logged FFI boundary.
     flow_pressure_soft_cap: u32,
-    /// Target combined live-flow count after a pressure reap.
+    /// Requested combined live-flow count after a pressure reap. The Apple
+    /// provider normalizes this below `soft_cap` at its logged FFI boundary.
     flow_pressure_low_water: u32,
     /// Minimum idle age before a TCP flow is eligible for pressure reaping.
     flow_pressure_idle_floor_ms: u32,
+    /// Combined TCP+UDP live-flow admission ceiling. `0` disables the ceiling.
+    live_flow_hard_cap: u32,
     /// Hard cap on pre-ready TCP egress `NWConnection.start` calls. `0`
     /// disables hard start admission refusal.
     tcp_start_in_flight_hard_cap: u32,
@@ -724,7 +746,8 @@ pub struct TransparentProxyConfig {
     /// Connect-timeout clamp while the start-latency breaker is open.
     tcp_breaker_connect_timeout_ms: u32,
     /// How to treat a flow the provider declines to intercept for its own
-    /// reasons (start hard cap / latency breaker, or a missing session).
+    /// reasons (decision-concurrency saturation, start hard cap / latency
+    /// breaker, or a missing session).
     /// Default [`FlowRefusalAction::Passthrough`].
     flow_refusal_action: FlowRefusalAction,
 }
@@ -741,9 +764,12 @@ impl TransparentProxyConfig {
             // isn't dead code and the documented per-flow cap is what's
             // actually applied at runtime.
             tcp_write_pump_max_pending_bytes: kib(256),
+            writer_memory_max_bytes: DEFAULT_WRITER_MEMORY_MAX_BYTES,
+            writer_memory_max_items: DEFAULT_WRITER_MEMORY_MAX_ITEMS,
             flow_pressure_soft_cap: DEFAULT_FLOW_PRESSURE_SOFT_CAP,
             flow_pressure_low_water: DEFAULT_FLOW_PRESSURE_LOW_WATER,
             flow_pressure_idle_floor_ms: DEFAULT_FLOW_PRESSURE_IDLE_FLOOR_MS,
+            live_flow_hard_cap: DEFAULT_LIVE_FLOW_HARD_CAP,
             tcp_start_in_flight_hard_cap: DEFAULT_TCP_START_IN_FLIGHT_HARD_CAP,
             tcp_start_in_flight_soft_cap: DEFAULT_TCP_START_IN_FLIGHT_SOFT_CAP,
             tcp_start_latency_breaker_p95_ms: DEFAULT_TCP_START_LATENCY_BREAKER_P95_MS,
@@ -776,17 +802,44 @@ impl TransparentProxyConfig {
     /// [`TransparentProxyConfig`] for the full contract.
     #[must_use]
     pub fn tcp_write_pump_max_pending_bytes(&self) -> usize {
-        self.tcp_write_pump_max_pending_bytes
+        self.tcp_write_pump_max_pending_bytes.min(
+            self.writer_memory_max_bytes
+                .saturating_sub(WRITER_MEMORY_UDP_SERVICE_RESERVE_BYTES)
+                .max(MIN_TCP_WRITE_PUMP_MAX_PENDING_BYTES),
+        )
+    }
+
+    /// Core/process-lifetime Swift retained-payload budget.
+    #[must_use]
+    pub fn writer_memory_max_bytes(&self) -> usize {
+        self.writer_memory_max_bytes
+    }
+
+    /// Core/process-lifetime Swift retained-item budget.
+    #[must_use]
+    pub fn writer_memory_max_items(&self) -> usize {
+        self.writer_memory_max_items
     }
 
     /// Combined TCP+UDP live-flow soft cap that triggers Swift's idle TCP
     /// pressure reaper. `0` disables this established-flow pressure reaper.
+    /// When both flow caps are enabled, Swift uses the smaller of this value
+    /// and [`Self::live_flow_hard_cap`].
     #[must_use]
     pub fn flow_pressure_soft_cap(&self) -> u32 {
         self.flow_pressure_soft_cap
     }
 
-    /// Target combined live-flow count after a pressure reap.
+    /// Combined TCP+UDP live-flow admission ceiling. `0` disables it.
+    #[must_use]
+    pub fn live_flow_hard_cap(&self) -> u32 {
+        self.live_flow_hard_cap
+    }
+
+    /// Requested target combined live-flow count after a pressure reap.
+    ///
+    /// The Apple provider validates this against the soft cap when the config
+    /// crosses the FFI boundary, where an invalid value can also be logged.
     #[must_use]
     pub fn flow_pressure_low_water(&self) -> u32 {
         self.flow_pressure_low_water
@@ -845,9 +898,10 @@ impl TransparentProxyConfig {
 
     generate_set_and_with! {
         /// Set how the provider treats a flow it declines to intercept for its
-        /// own reasons — start hard cap / latency breaker, or a missing session.
-        /// Default [`FlowRefusalAction::Passthrough`] (fail open); see the type
-        /// docs before choosing [`FlowRefusalAction::Block`].
+        /// own reasons — decision-concurrency saturation, start hard cap /
+        /// latency breaker, or a missing session. Default
+        /// [`FlowRefusalAction::Passthrough`] (fail open); see the type docs
+        /// before choosing [`FlowRefusalAction::Block`].
         pub fn flow_refusal_action(mut self, action: FlowRefusalAction) -> Self {
             self.flow_refusal_action = action;
             self
@@ -899,8 +953,38 @@ impl TransparentProxyConfig {
     }
 
     generate_set_and_with! {
+        /// Set the core/process-lifetime payload cap shared by Swift transport
+        /// pumps and direct-forwarder buffers.
+        /// Values are clamped to `[8 MiB + 128 KiB, 2^40 - 1]`. The minimum
+        /// holds one maximum-sized TCP writer retry, one 64 KiB TCP read view,
+        /// and one maximum UDP datagram simultaneously. Apple client reads
+        /// with larger backing allocations can still exhaust a small budget.
+        pub fn writer_memory_max_bytes(mut self, bytes: usize) -> Self {
+            self.writer_memory_max_bytes = bytes.clamp(
+                MIN_WRITER_MEMORY_MAX_BYTES,
+                MAX_WRITER_MEMORY_MAX_BYTES,
+            );
+            self
+        }
+    }
+
+    generate_set_and_with! {
+        /// Set the core/process-lifetime retained-item cap shared by Swift
+        /// transport pumps and direct-forwarder buffers.
+        pub fn writer_memory_max_items(mut self, items: usize) -> Self {
+            self.writer_memory_max_items = items.clamp(
+                MIN_WRITER_MEMORY_MAX_ITEMS,
+                MAX_WRITER_MEMORY_MAX_ITEMS,
+            );
+            self
+        }
+    }
+
+    generate_set_and_with! {
         /// Set the combined TCP+UDP live-flow soft cap that triggers Swift's
         /// idle TCP pressure reaper. `0` disables this established-flow reaper.
+        /// If the live-flow hard cap is also enabled, Swift bounds the effective
+        /// soft cap by that admission ceiling.
         pub fn flow_pressure_soft_cap(mut self, value: u32) -> Self {
             self.flow_pressure_soft_cap = value;
             self
@@ -908,9 +992,19 @@ impl TransparentProxyConfig {
     }
 
     generate_set_and_with! {
-        /// Set the target combined live-flow count after a pressure reap.
+        /// Set the requested combined live-flow count after a pressure reap.
         pub fn flow_pressure_low_water(mut self, value: u32) -> Self {
             self.flow_pressure_low_water = value;
+            self
+        }
+    }
+
+    generate_set_and_with! {
+        /// Set the combined TCP+UDP live-flow admission ceiling. `0` disables
+        /// it. Values near the undocumented kernel edge require on-device
+        /// calibration; the default keeps a conservative margin.
+        pub fn live_flow_hard_cap(mut self, value: u32) -> Self {
+            self.live_flow_hard_cap = value;
             self
         }
     }
@@ -1028,9 +1122,73 @@ mod transparent_proxy_config_tests {
     }
 
     #[test]
+    fn writer_memory_defaults_and_bounds_are_stable() {
+        let defaults = TransparentProxyConfig::new();
+        assert_eq!(
+            defaults.writer_memory_max_bytes(),
+            DEFAULT_WRITER_MEMORY_MAX_BYTES
+        );
+        assert_eq!(
+            defaults.writer_memory_max_items(),
+            DEFAULT_WRITER_MEMORY_MAX_ITEMS
+        );
+
+        let minimum = TransparentProxyConfig::new()
+            .with_writer_memory_max_bytes(0)
+            .with_writer_memory_max_items(0);
+        assert_eq!(
+            minimum.writer_memory_max_bytes(),
+            MIN_WRITER_MEMORY_MAX_BYTES
+        );
+        assert_eq!(
+            minimum.writer_memory_max_items(),
+            MIN_WRITER_MEMORY_MAX_ITEMS
+        );
+
+        let maximum = TransparentProxyConfig::new()
+            .with_writer_memory_max_bytes(usize::MAX)
+            .with_writer_memory_max_items(usize::MAX);
+        assert_eq!(
+            maximum.writer_memory_max_bytes(),
+            MAX_WRITER_MEMORY_MAX_BYTES
+        );
+        assert_eq!(
+            maximum.writer_memory_max_items(),
+            MAX_WRITER_MEMORY_MAX_ITEMS
+        );
+
+        let tcp_then_writer = TransparentProxyConfig::new()
+            .with_tcp_write_pump_max_pending_bytes(MAX_TCP_WRITE_PUMP_MAX_PENDING_BYTES)
+            .with_writer_memory_max_bytes(MIN_WRITER_MEMORY_MAX_BYTES);
+        let writer_then_tcp = TransparentProxyConfig::new()
+            .with_writer_memory_max_bytes(MIN_WRITER_MEMORY_MAX_BYTES)
+            .with_tcp_write_pump_max_pending_bytes(MAX_TCP_WRITE_PUMP_MAX_PENDING_BYTES);
+        assert_eq!(
+            tcp_then_writer.tcp_write_pump_max_pending_bytes(),
+            MAX_TCP_WRITE_PUMP_MAX_PENDING_BYTES
+        );
+        assert_eq!(
+            writer_then_tcp.tcp_write_pump_max_pending_bytes(),
+            MAX_TCP_WRITE_PUMP_MAX_PENDING_BYTES
+        );
+        assert_eq!(
+            tcp_then_writer.writer_memory_max_bytes(),
+            MIN_WRITER_MEMORY_MAX_BYTES
+        );
+        assert!(
+            tcp_then_writer.writer_memory_max_bytes()
+                >= tcp_then_writer.tcp_write_pump_max_pending_bytes()
+                    + WRITER_MEMORY_UDP_SERVICE_RESERVE_BYTES
+                    + kib(64),
+            "the smallest aggregate must leave a TCP read view beside the maximum retry and UDP"
+        );
+    }
+
+    #[test]
     fn overload_defaults_match_swift_fallbacks() {
         let cfg = TransparentProxyConfig::new();
         assert_eq!(cfg.flow_pressure_soft_cap(), DEFAULT_FLOW_PRESSURE_SOFT_CAP);
+        assert_eq!(cfg.live_flow_hard_cap(), DEFAULT_LIVE_FLOW_HARD_CAP);
         assert_eq!(
             cfg.flow_pressure_low_water(),
             DEFAULT_FLOW_PRESSURE_LOW_WATER
@@ -1068,9 +1226,10 @@ mod transparent_proxy_config_tests {
     #[test]
     fn overload_knobs_round_trip() {
         let cfg = TransparentProxyConfig::new()
-            .with_flow_pressure_soft_cap(1)
-            .with_flow_pressure_low_water(2)
+            .with_flow_pressure_soft_cap(2)
+            .with_flow_pressure_low_water(1)
             .with_flow_pressure_idle_floor_ms(3)
+            .with_live_flow_hard_cap(10)
             .with_tcp_start_in_flight_hard_cap(4)
             .with_tcp_start_in_flight_soft_cap(5)
             .with_tcp_start_latency_breaker_p95_ms(6)
@@ -1078,15 +1237,39 @@ mod transparent_proxy_config_tests {
             .with_tcp_pressure_connect_timeout_ms(8)
             .with_tcp_breaker_connect_timeout_ms(9);
 
-        assert_eq!(cfg.flow_pressure_soft_cap(), 1);
-        assert_eq!(cfg.flow_pressure_low_water(), 2);
+        assert_eq!(cfg.flow_pressure_soft_cap(), 2);
+        assert_eq!(cfg.flow_pressure_low_water(), 1);
         assert_eq!(cfg.flow_pressure_idle_floor_ms(), 3);
+        assert_eq!(cfg.live_flow_hard_cap(), 10);
         assert_eq!(cfg.tcp_start_in_flight_hard_cap(), 4);
         assert_eq!(cfg.tcp_start_in_flight_soft_cap(), 5);
         assert_eq!(cfg.tcp_start_latency_breaker_p95_ms(), 6);
         assert_eq!(cfg.tcp_start_latency_breaker_close_p95_ms(), 7);
         assert_eq!(cfg.tcp_pressure_connect_timeout_ms(), 8);
         assert_eq!(cfg.tcp_breaker_connect_timeout_ms(), 9);
+    }
+
+    #[test]
+    fn flow_pressure_low_water_round_trips_before_ffi_validation() {
+        let below = TransparentProxyConfig::new()
+            .with_flow_pressure_soft_cap(10)
+            .with_flow_pressure_low_water(0);
+        assert_eq!(below.flow_pressure_low_water(), 0);
+
+        let above = TransparentProxyConfig::new()
+            .with_flow_pressure_soft_cap(10)
+            .with_flow_pressure_low_water(11);
+        assert_eq!(above.flow_pressure_low_water(), 11);
+
+        let at_cap = TransparentProxyConfig::new()
+            .with_flow_pressure_soft_cap(10)
+            .with_flow_pressure_low_water(10);
+        assert_eq!(at_cap.flow_pressure_low_water(), 10);
+
+        let disabled = TransparentProxyConfig::new()
+            .with_flow_pressure_soft_cap(0)
+            .with_flow_pressure_low_water(11);
+        assert_eq!(disabled.flow_pressure_low_water(), 11);
     }
 
     /// Pin the default for the `exclude` flag — flipping the

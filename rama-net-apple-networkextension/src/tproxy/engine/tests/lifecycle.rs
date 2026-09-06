@@ -4,17 +4,72 @@ use super::common::*;
 use crate::tproxy::engine::*;
 use crate::tproxy::{TransparentProxyFlowMeta, TransparentProxyFlowProtocol};
 use rama_core::bytes::Bytes;
-use std::sync::{Arc, Barrier};
+use std::sync::Arc;
 use std::time::Duration;
 
-// The TCP idle backstop, the UDP max-lifetime cap and the TCP paused-
-// drain wait are the three timer-based safety nets that keep a wedged
-// per-flow bridge from holding the macOS NWConnection registration
-// forever. The tests below pin both the constant values and the fact
-// that the builder applies them as defaults — a regression that
-// silently flips any of them back to `None` would let one wedged flow
-// per leak path live indefinitely, which is exactly the failure mode
-// these backstops exist to prevent.
+#[tokio::test(start_paused = true)]
+async fn udp_idle_wait_reuses_and_resets_one_deadline() {
+    let timeout = Duration::from_millis(100);
+    let notify = Arc::new(tokio::sync::Notify::new());
+    let waiter_notify = notify.clone();
+    let waiter = tokio::spawn(async move {
+        wait_for_udp_idle(timeout, &waiter_notify).await;
+    });
+    tokio::task::yield_now().await;
+
+    for _ in 0..3 {
+        tokio::time::advance(Duration::from_millis(80)).await;
+        notify.notify_one();
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+    }
+    tokio::time::advance(Duration::from_millis(99)).await;
+    tokio::task::yield_now().await;
+    assert!(!waiter.is_finished());
+    tokio::time::advance(Duration::from_millis(1)).await;
+    waiter.await.expect("idle waiter task");
+}
+
+#[tokio::test(start_paused = true)]
+async fn udp_idle_activity_wins_a_deadline_tie() {
+    let timeout = Duration::from_millis(100);
+    let notify = Arc::new(tokio::sync::Notify::new());
+    let waiter_notify = notify.clone();
+    let waiter = tokio::spawn(async move {
+        wait_for_udp_idle(timeout, &waiter_notify).await;
+    });
+    tokio::task::yield_now().await;
+
+    tokio::time::advance(timeout).await;
+    notify.notify_one();
+    tokio::task::yield_now().await;
+    assert!(!waiter.is_finished());
+    tokio::time::advance(timeout).await;
+    waiter.await.expect("idle waiter task");
+}
+
+#[tokio::test(start_paused = true)]
+async fn udp_idle_wait_accepts_unrepresentably_large_timeout_and_activity() {
+    let notify = Arc::new(tokio::sync::Notify::new());
+    let waiter_notify = notify.clone();
+    let waiter = tokio::spawn(async move {
+        wait_for_udp_idle(Duration::MAX, &waiter_notify).await;
+    });
+    tokio::task::yield_now().await;
+    assert!(!waiter.is_finished());
+
+    // An activity notification must not reintroduce the `Instant + Duration`
+    // overflow that this path used to contain.
+    notify.notify_one();
+    tokio::task::yield_now().await;
+    assert!(!waiter.is_finished());
+    waiter.abort();
+}
+
+// TCP idle, UDP idle, and TCP paused-drain timers are default backstops. The
+// UDP absolute max lifetime is intentionally different: it remains available
+// as an explicit policy but defaults to `None`, allowing active long-lived
+// QUIC / HTTP/3 flows to outlive the conventional 15-minute value.
 
 #[test]
 fn default_tcp_idle_timeout_constant_is_fifteen_minutes() {
@@ -40,14 +95,22 @@ fn builder_without_tcp_idle_timeout_sets_none() {
 }
 
 #[test]
-fn default_udp_max_flow_lifetime_constant_is_fifteen_minutes() {
+fn udp_max_flow_lifetime_opt_in_constant_is_fifteen_minutes() {
     assert_eq!(DEFAULT_UDP_MAX_FLOW_LIFETIME, Duration::from_mins(15));
 }
 
 #[test]
-fn builder_default_udp_max_flow_lifetime_is_the_constant() {
+fn builder_default_udp_max_flow_lifetime_is_none() {
     let builder =
         TransparentProxyEngineBuilder::new(TestHandlerFactory(TestHandler::passthrough()));
+    assert_eq!(builder.current_udp_max_flow_lifetime(), None);
+}
+
+#[test]
+fn builder_udp_max_flow_lifetime_remains_explicitly_configurable() {
+    let builder =
+        TransparentProxyEngineBuilder::new(TestHandlerFactory(TestHandler::passthrough()))
+            .with_udp_max_flow_lifetime(DEFAULT_UDP_MAX_FLOW_LIFETIME);
     assert_eq!(
         builder.current_udp_max_flow_lifetime(),
         Some(DEFAULT_UDP_MAX_FLOW_LIFETIME)
@@ -86,6 +149,37 @@ fn builder_without_udp_idle_timeout_sets_none() {
 }
 
 #[test]
+fn engine_exports_disabled_udp_idle_timeout_as_zero() {
+    let engine = TransparentProxyEngineBuilder::new(TestHandlerFactory(TestHandler::passthrough()))
+        .with_runtime_factory(TestRuntimeFactory)
+        .without_udp_idle_timeout()
+        .build()
+        .expect("build engine");
+    assert_eq!(engine.udp_idle_timeout_ms(), 0);
+    engine.stop(0);
+}
+
+#[test]
+fn engine_exports_enabled_udp_idle_timeout_as_ceil_nonzero_millis() {
+    for (timeout, expected_ms) in [
+        (Duration::ZERO, 1),
+        (Duration::from_nanos(1), 1),
+        (Duration::from_nanos(999_999), 1),
+        (Duration::from_nanos(1_000_001), 2),
+        (Duration::MAX, u64::MAX),
+    ] {
+        let engine =
+            TransparentProxyEngineBuilder::new(TestHandlerFactory(TestHandler::passthrough()))
+                .with_runtime_factory(TestRuntimeFactory)
+                .with_udp_idle_timeout(timeout)
+                .build()
+                .expect("build engine");
+        assert_eq!(engine.udp_idle_timeout_ms(), expected_ms, "{timeout:?}");
+        engine.stop(0);
+    }
+}
+
+#[test]
 fn default_tcp_paused_drain_max_wait_constant_is_one_minute() {
     assert_eq!(DEFAULT_TCP_PAUSED_DRAIN_MAX_WAIT, Duration::from_mins(1));
 }
@@ -115,6 +209,17 @@ fn engine_builds_live_and_stop_is_terminal() {
 }
 
 #[test]
+fn engine_stop_accepts_maximum_drain_wait_without_timer_overflow() {
+    let engine = build_engine_with_stop_drain_max_wait(TestHandler::passthrough(), Duration::MAX);
+    let started = std::time::Instant::now();
+    engine.stop(0);
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "a clean engine with a huge configured backstop must still stop promptly"
+    );
+}
+
+#[test]
 fn builder_rejects_zero_channel_capacity() {
     // `tokio::sync::mpsc::channel(0)` panics; an explicit `Some(0)` is
     // treated as a misconfiguration rather than silently substituting the
@@ -132,6 +237,76 @@ fn builder_rejects_zero_channel_capacity() {
     assert!(make(None, Some(0)).is_err(), "Some(0) udp must error");
     let engine = make(None, None).expect("None defaults must build");
     engine.stop(0);
+}
+
+#[test]
+fn udp_ingress_byte_limits_are_immutable_validated_builder_state() {
+    let build = |per_flow: Option<usize>, global: Option<usize>| {
+        let mut builder =
+            TransparentProxyEngineBuilder::new(TestHandlerFactory(TestHandler::passthrough()))
+                .with_runtime_factory(TestRuntimeFactory);
+        builder = builder.maybe_with_udp_ingress_per_flow_max_bytes(per_flow);
+        builder = builder.maybe_with_udp_ingress_global_max_bytes(global);
+        builder.build()
+    };
+
+    assert!(build(Some(0), None).is_err());
+    assert!(build(Some(MAX_UDP_DATAGRAM_PAYLOAD_SIZE - 1), None).is_err());
+    assert!(build(None, Some(0)).is_err());
+    assert!(
+        build(
+            Some(MAX_UDP_DATAGRAM_PAYLOAD_SIZE + 1),
+            Some(MAX_UDP_DATAGRAM_PAYLOAD_SIZE),
+        )
+        .is_err()
+    );
+
+    let engine = build(None, None).expect("default UDP ingress byte limits must build");
+    assert_eq!(
+        engine.udp_ingress_per_flow_max_bytes_for_test(),
+        DEFAULT_UDP_INGRESS_PER_FLOW_MAX_BYTES
+    );
+    let snapshot = engine.udp_ingress_budget_for_test().snapshot();
+    assert_eq!(snapshot.retained_bytes, 0);
+    assert_eq!(
+        DEFAULT_UDP_INGRESS_GLOBAL_MAX_BYTES,
+        rama_utils::octets::mib(16)
+    );
+    engine.stop(0);
+}
+
+#[test]
+fn udp_ingress_probe_lease_defaults_overrides_and_rejects_unbounded_values() {
+    let build = |lease: Option<Duration>| {
+        let mut builder =
+            TransparentProxyEngineBuilder::new(TestHandlerFactory(TestHandler::passthrough()))
+                .with_runtime_factory(TestRuntimeFactory);
+        builder = builder.maybe_with_udp_ingress_probe_lease(lease);
+        builder.build()
+    };
+
+    assert!(build(Some(Duration::ZERO)).is_err());
+    assert!(build(Some(MAX_UDP_INGRESS_PROBE_LEASE + Duration::from_millis(1))).is_err());
+
+    let default_engine = build(None).expect("default probe lease must build");
+    assert_eq!(
+        default_engine.udp_ingress_probe_lease(),
+        DEFAULT_UDP_INGRESS_PROBE_LEASE
+    );
+    default_engine.stop(0);
+
+    let custom = Duration::from_millis(500);
+    let custom_engine = build(Some(custom)).expect("bounded probe lease override must build");
+    assert_eq!(custom_engine.udp_ingress_probe_lease(), custom);
+    custom_engine.stop(0);
+
+    let max_engine =
+        build(Some(MAX_UDP_INGRESS_PROBE_LEASE)).expect("maximum bounded probe lease must build");
+    assert_eq!(
+        max_engine.udp_ingress_probe_lease(),
+        MAX_UDP_INGRESS_PROBE_LEASE
+    );
+    max_engine.stop(0);
 }
 
 #[test]
@@ -395,29 +570,61 @@ fn stop_is_bounded_when_all_runtime_workers_are_blocked() {
     let budget = Duration::from_millis(250);
     let engine = build_engine_with_stop_drain_max_wait(TestHandler::passthrough(), budget);
 
-    // Occupy both `TestRuntimeFactory` workers with tasks that block
-    // their thread without ever yielding to the scheduler.
+    // Acknowledge each blocked worker before submitting the next task: a
+    // scheduler may otherwise batch both tasks onto one worker's local queue
+    // and leave the second task behind the first blocked poll.
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+    let mut release_senders = Vec::new();
     for _ in 0..2 {
         let ready_tx = ready_tx.clone();
+        let finished_tx = finished_tx.clone();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        release_senders.push(release_tx);
         engine.rt.as_ref().unwrap().spawn(async move {
-            ready_tx.send(()).unwrap();
-            loop {
-                std::thread::sleep(Duration::from_secs(60));
+            if ready_tx.send(()).is_err() {
+                return;
             }
+            // Dropping the senders releases every worker, including if setup
+            // unwinds or the independent stop deadline expires.
+            _ = release_rx.recv();
+            _ = finished_tx.send(());
         });
+        ready_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("blocker running before the next task is submitted");
     }
-    // Only proceed once both blockers actually occupy a worker.
-    ready_rx
-        .recv_timeout(Duration::from_secs(2))
-        .expect("first blocker running");
-    ready_rx
-        .recv_timeout(Duration::from_secs(2))
-        .expect("second blocker running");
 
+    let upper_bound = budget + STOP_HARD_CAP_SLACK + Duration::from_secs(3);
     let started = Instant::now();
-    engine.stop(0);
-    let elapsed = started.elapsed();
+    let (elapsed, stopped_before_release) = std::thread::scope(|scope| {
+        let deadline = started + upper_bound;
+        let (stopped_tx, stopped_rx) = std::sync::mpsc::channel::<()>();
+        // The test's own backstop must not depend on the wedged runtime or
+        // on engine.stop returning. Releasing the blockers lets an unbounded
+        // runtime join return too, so the assertion can report that regression.
+        let release_workers = scope.spawn(move || {
+            let stopped = stopped_rx
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .is_ok();
+            drop(release_senders);
+            stopped
+        });
+        engine.stop(0);
+        let elapsed = started.elapsed();
+        _ = stopped_tx.send(());
+        // Scoped ownership also joins this helper if stop unwinds: dropping
+        // stopped_tx disconnects its receiver and releases the workers.
+        (
+            elapsed,
+            release_workers.join().expect("worker release helper"),
+        )
+    });
+    for _ in 0..2 {
+        finished_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("blocked worker released after stop returned");
+    }
 
     assert!(
         elapsed >= budget,
@@ -425,7 +632,7 @@ fn stop_is_bounded_when_all_runtime_workers_are_blocked() {
          workers did not actually wedge the drain"
     );
     assert!(
-        elapsed < budget + STOP_HARD_CAP_SLACK + Duration::from_secs(3),
+        stopped_before_release && elapsed < upper_bound,
         "stop did not return within the wedged-runtime bound ({elapsed:?})"
     );
 }
@@ -439,18 +646,20 @@ fn ffi_decision_is_polled_when_all_runtime_workers_are_blocked() {
             .build()
             .unwrap(),
     );
-    let release = Arc::new(Barrier::new(3));
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let mut release_senders = Vec::new();
     for _ in 0..2 {
         let ready_tx = ready_tx.clone();
-        let release = Arc::clone(&release);
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        release_senders.push(release_tx);
         _ = runtime.spawn(async move {
-            ready_tx.send(()).unwrap();
-            release.wait();
+            if ready_tx.send(()).is_err() {
+                return;
+            }
+            _ = release_rx.recv();
         });
+        ready_rx.recv_timeout(Duration::from_secs(1)).unwrap();
     }
-    ready_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-    ready_rx.recv_timeout(Duration::from_secs(1)).unwrap();
 
     let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
     let decision_thread = std::thread::spawn(move || {
@@ -463,7 +672,7 @@ fn ffi_decision_is_polled_when_all_runtime_workers_are_blocked() {
     });
     let inline_result = result_rx.recv_timeout(Duration::from_millis(250));
 
-    release.wait();
+    drop(release_senders);
     let eventual_result = decision_thread.join().unwrap();
 
     assert_eq!(

@@ -23,6 +23,26 @@ final class EngineHandleTests: XCTestCase {
         XCTAssertNotNil(handle, "engine should construct with the test CA config")
     }
 
+    func testConfigMapsPressureFieldsAcrossFfi() {
+        guard
+            let handle = RamaTransparentProxyEngineHandle(
+                engineConfigJson: TestFixtures.engineConfigJson()),
+            let config = handle.config()
+        else {
+            return XCTFail("engine config round-trip")
+        }
+        defer { handle.stop(reason: 0) }
+
+        XCTAssertEqual(config.flowPressureSoftCap, 450)
+        XCTAssertEqual(config.flowPressureLowWater, 350)
+        XCTAssertEqual(config.flowPressureIdleFloorMs, 120_000)
+        XCTAssertEqual(config.udpChannelCapacity, 32)
+        XCTAssertEqual(config.udpIngressPerFlowMaxBytes, 262_144)
+        XCTAssertEqual(config.udpIngressGlobalMaxBytes, 16_777_216)
+        XCTAssertEqual(config.writerMemoryMaxBytes, 64 * 1024 * 1024)
+        XCTAssertEqual(config.writerMemoryMaxItems, 65_536)
+    }
+
     /// Malformed / wrong-shape engine config must fail the FALLIBLE init
     /// (return nil), not crash and not silently produce a half-built engine.
     /// Every other test feeds a valid config, so the rejection path — the

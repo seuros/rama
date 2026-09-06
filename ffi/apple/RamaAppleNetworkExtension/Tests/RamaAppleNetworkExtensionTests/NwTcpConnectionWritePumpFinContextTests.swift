@@ -50,7 +50,6 @@ final class NwTcpConnectionWritePumpFinContextTests: XCTestCase {
         let pump = NwTcpConnectionWritePump(
             connection: mock,
             queue: queue,
-            lingerCloseDeadline: .milliseconds(2_000),
             onDrained: {}
         )
 
@@ -75,5 +74,199 @@ final class NwTcpConnectionWritePumpFinContextTests: XCTestCase {
                 + "to signal TCP half-close; got "
                 + String(describing: chunk?.contentContext)
         )
+    }
+
+    func testFinCompletionReturnsDrainCallbackToPumpQueue() {
+        let mock = MockNwConnection()
+        mock.transition(to: .ready)
+        let queue = makeQueue()
+        let queueKey = DispatchSpecificKey<UInt8>()
+        queue.setSpecific(key: queueKey, value: 1)
+        let callbackOnQueue = TestValue(false)
+        let callback = expectation(description: "FIN drain callback")
+        let pump = NwTcpConnectionWritePump(
+            connection: mock,
+            queue: queue,
+            onDrained: {})
+
+        pump.closeWhenDrained {
+            callbackOnQueue.set(DispatchQueue.getSpecific(key: queueKey) == 1)
+            callback.fulfill()
+        }
+        waitForQueueDrain(queue)
+        XCTAssertTrue(mock.completePendingSend(error: nil))
+        wait(for: [callback], timeout: 1.0)
+
+        XCTAssertTrue(callbackOnQueue.get())
+    }
+
+    func testDataCompletionAlreadyOnConnectionQueueRunsInline() {
+        let mock = MockNwConnection()
+        mock.transition(to: .ready)
+        let queue = makeQueue()
+        let drained = TestValue(0)
+        let pump = NwTcpConnectionWritePump(
+            connection: mock,
+            queue: queue,
+            onDrained: { drained.update { $0 += 1 } }
+        )
+
+        XCTAssertEqual(
+            pump.enqueue(Data(repeating: 0xA1, count: writePumpMaxPendingBytes)),
+            .accepted)
+        waitForQueueDrain(queue)
+        XCTAssertEqual(pump.enqueue(Data([0xB1])), .paused)
+
+        queue.sync {
+            XCTAssertTrue(mock.completePendingSend(error: nil))
+            XCTAssertEqual(
+                drained.get(), 1,
+                "NW completion already delivered on its queue must not add a hop")
+        }
+    }
+
+    func testDataCompletionOffConnectionQueueIsNormalized() {
+        let mock = MockNwConnection()
+        mock.transition(to: .ready)
+        let queue = makeQueue()
+        let drained = TestValue(0)
+        let pump = NwTcpConnectionWritePump(
+            connection: mock,
+            queue: queue,
+            onDrained: { drained.update { $0 += 1 } }
+        )
+
+        XCTAssertEqual(
+            pump.enqueue(Data(repeating: 0xA1, count: writePumpMaxPendingBytes)),
+            .accepted)
+        waitForQueueDrain(queue)
+        XCTAssertEqual(pump.enqueue(Data([0xB1])), .paused)
+        let blockerEntered = expectation(description: "queue blocker entered")
+        let releaseBlocker = DispatchSemaphore(value: 0)
+        queue.async {
+            blockerEntered.fulfill()
+            releaseBlocker.wait()
+        }
+        wait(for: [blockerEntered], timeout: 1.0)
+
+        XCTAssertTrue(mock.completePendingSend(error: nil))
+        XCTAssertEqual(drained.get(), 0, "off-queue completion must be dispatched")
+        releaseBlocker.signal()
+        waitForQueueDrain(queue)
+        XCTAssertEqual(drained.get(), 1)
+    }
+
+    func testDataSendErrorReachesTerminalBeforeDrainWaiter() {
+        let mock = MockNwConnection()
+        mock.transition(to: .ready)
+        let queue = makeQueue()
+        let events = Locked([String]())
+        let terminal = expectation(description: "terminal owner notified")
+        let drained = expectation(description: "drain waiter released")
+        let pump = NwTcpConnectionWritePump(
+            connection: mock,
+            queue: queue,
+            onDrained: {},
+            onTerminal: { _ in
+                events.withLock { $0.append("terminal") }
+                terminal.fulfill()
+            })
+
+        XCTAssertEqual(pump.enqueue(Data([0x01])), .accepted)
+        waitForQueueDrain(queue)
+        XCTAssertEqual(mock.pendingSendCount, 1)
+        pump.closeWhenDrained {
+            events.withLock { $0.append("drain") }
+            drained.fulfill()
+        }
+        waitForQueueDrain(queue)
+
+        XCTAssertTrue(mock.completePendingSend(error: .posix(.ECONNRESET)))
+        wait(for: [terminal, drained], timeout: 1.0)
+        XCTAssertEqual(events.withLock { $0 }, ["terminal", "drain"])
+    }
+
+    func testFinSendErrorReachesTerminalBeforeDrainWaiter() {
+        let mock = MockNwConnection()
+        mock.transition(to: .ready)
+        let queue = makeQueue()
+        let events = Locked([String]())
+        let observed = TestValue<Error?>(nil)
+        let terminal = expectation(description: "terminal owner notified")
+        let drained = expectation(description: "drain waiter released")
+        let pump = NwTcpConnectionWritePump(
+            connection: mock,
+            queue: queue,
+            onDrained: {},
+            onTerminal: { error in
+                observed.set(error)
+                events.withLock { $0.append("terminal") }
+                terminal.fulfill()
+            })
+
+        pump.closeWhenDrained {
+            events.withLock { $0.append("drain") }
+            drained.fulfill()
+        }
+        waitForQueueDrain(queue)
+        XCTAssertEqual(mock.pendingSendCount, 1, "FIN completion is pending")
+
+        XCTAssertTrue(mock.completePendingSend(error: .posix(.ECONNRESET)))
+        wait(for: [terminal, drained], timeout: 1.0)
+        XCTAssertEqual(events.withLock { $0 }, ["terminal", "drain"])
+        guard case .posix(.ECONNRESET)? = observed.get() as? NWError else {
+            return XCTFail("original FIN send error was not preserved")
+        }
+        XCTAssertEqual(mock.cancelCount, 1)
+    }
+
+    func testPendingFinCompletionDoesNotRetainPump() {
+        let mock = MockNwConnection()
+        mock.transition(to: .ready)
+        let queue = makeQueue()
+        weak var weakPump: NwTcpConnectionWritePump?
+
+        autoreleasepool {
+            let pump = NwTcpConnectionWritePump(
+                connection: mock,
+                queue: queue,
+                onDrained: {})
+            weakPump = pump
+            pump.closeWhenDrained()
+            waitForQueueDrain(queue)
+            XCTAssertEqual(mock.pendingSendCount, 1)
+        }
+
+        waitForQueueDrain(queue)
+        XCTAssertNil(
+            weakPump,
+            "NWConnection retaining its FIN completion must not retain the pump")
+    }
+
+    func testDeinitFallbackReturnsDrainCallbackToPumpQueue() {
+        let mock = MockNwConnection()
+        mock.transition(to: .ready)
+        let queue = makeQueue()
+        let queueKey = DispatchSpecificKey<UInt8>()
+        queue.setSpecific(key: queueKey, value: 1)
+        let callbackOnQueue = TestValue(false)
+        let callback = expectation(description: "deinit drain callback")
+        var pump: NwTcpConnectionWritePump? = NwTcpConnectionWritePump(
+            connection: mock,
+            queue: queue,
+            onDrained: {})
+
+        XCTAssertEqual(pump?.enqueue(Data([0x01])), .accepted)
+        waitForQueueDrain(queue)
+        XCTAssertEqual(mock.pendingSendCount, 1)
+        pump?.closeWhenDrained {
+            callbackOnQueue.set(DispatchQueue.getSpecific(key: queueKey) == 1)
+            callback.fulfill()
+        }
+        waitForQueueDrain(queue)
+        pump = nil
+        wait(for: [callback], timeout: 1.0)
+
+        XCTAssertTrue(callbackOnQueue.get())
     }
 }

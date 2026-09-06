@@ -41,6 +41,35 @@ typedef struct RamaTransparentProxyTcpSession RamaTransparentProxyTcpSession;
 /// Concurrency: see the contract block at the top of this header.
 typedef struct RamaTransparentProxyUdpSession RamaTransparentProxyUdpSession;
 
+/// Opaque C11 atomic used by process/core-lifetime Swift payload budgets.
+///
+/// Swift cannot directly import `_Atomic uint64_t`, so this tiny wrapper keeps
+/// the healthy writer admission/release path as a packed lock-free CAS without
+/// adding a package dependency. The packed value's layout is owned by Swift.
+typedef struct RamaWriterBudgetAtomic RamaWriterBudgetAtomic;
+
+RamaWriterBudgetAtomic* _Nullable rama_writer_budget_atomic_new(uint64_t initial_value);
+void rama_writer_budget_atomic_free(RamaWriterBudgetAtomic* _Nullable atomic);
+uint64_t rama_writer_budget_atomic_load(const RamaWriterBudgetAtomic* atomic);
+/// Strong compare-and-exchange: false means the value differed from `expected`,
+/// which is then updated to the observed value. Never fails spuriously; Swift
+/// also uses this for one-shot, exclusively owned telemetry state transitions.
+bool rama_writer_budget_atomic_compare_exchange(
+    RamaWriterBudgetAtomic* atomic,
+    uint64_t* expected,
+    uint64_t desired
+);
+/// Sequentially-consistent variants for publication handshakes which span
+/// multiple atomics. Capacity counters should keep using the cheaper API above.
+/// Compare-and-exchange has the same strong semantics as the API above.
+uint64_t rama_writer_budget_atomic_load_seq_cst(const RamaWriterBudgetAtomic* atomic);
+bool rama_writer_budget_atomic_compare_exchange_seq_cst(
+    RamaWriterBudgetAtomic* atomic,
+    uint64_t* expected,
+    uint64_t desired
+);
+bool rama_writer_budget_atomic_is_lock_free(const RamaWriterBudgetAtomic* atomic);
+
 /// Borrowed byte view.
 ///
 /// Ownership is retained by the caller. `ptr` may be NULL only if `len == 0`.
@@ -261,7 +290,7 @@ typedef struct {
     /// Combined TCP+UDP live-flow soft cap that triggers the idle TCP
     /// pressure reaper. 0 disables this established-flow reaper.
     uint32_t flow_pressure_soft_cap;
-    /// Target combined live-flow count after a pressure reap.
+    /// Requested target; Swift validates it against the soft cap.
     uint32_t flow_pressure_low_water;
     /// Minimum idle age before a TCP flow is eligible for pressure reaping.
     uint32_t flow_pressure_idle_floor_ms;
@@ -281,6 +310,8 @@ typedef struct {
     /// hard cap / latency breaker, or a missing session): `0` = Block (fail
     /// closed), `1` = Passthrough (default, fail open). Always logged either way.
     uint32_t flow_refusal_action;
+    /// Combined TCP+UDP live-flow admission ceiling. 0 disables the ceiling.
+    uint32_t live_flow_hard_cap;
 } RamaTransparentProxyConfig;
 
 /// Initialization config passed once before using engine APIs.
@@ -320,10 +351,11 @@ _Static_assert(offsetof(RamaTransparentProxyFlowMeta, is_bound) == 151, "RamaTra
 _Static_assert(sizeof(RamaTransparentProxyNetworkRule) == 56, "RamaTransparentProxyNetworkRule ABI drift");
 _Static_assert(offsetof(RamaTransparentProxyNetworkRule, local_network_utf8) == 24, "RamaTransparentProxyNetworkRule.local_network_utf8 offset drift");
 _Static_assert(offsetof(RamaTransparentProxyNetworkRule, protocol) == 44, "RamaTransparentProxyNetworkRule.protocol offset drift");
-_Static_assert(sizeof(RamaTransparentProxyConfig) == 80, "RamaTransparentProxyConfig ABI drift");
+_Static_assert(sizeof(RamaTransparentProxyConfig) == 88, "RamaTransparentProxyConfig ABI drift");
 _Static_assert(offsetof(RamaTransparentProxyConfig, flow_pressure_soft_cap) == 40, "RamaTransparentProxyConfig.flow_pressure_soft_cap offset drift");
 _Static_assert(offsetof(RamaTransparentProxyConfig, tcp_breaker_connect_timeout_ms) == 72, "RamaTransparentProxyConfig.tcp_breaker_connect_timeout_ms offset drift");
 _Static_assert(offsetof(RamaTransparentProxyConfig, flow_refusal_action) == 76, "RamaTransparentProxyConfig.flow_refusal_action offset drift");
+_Static_assert(offsetof(RamaTransparentProxyConfig, live_flow_hard_cap) == 80, "RamaTransparentProxyConfig.live_flow_hard_cap offset drift");
 _Static_assert(sizeof(RamaTransparentProxyInitConfig) == 48, "RamaTransparentProxyInitConfig ABI drift");
 _Static_assert(offsetof(RamaTransparentProxyInitConfig, bundle_identifier_utf8) == 32, "RamaTransparentProxyInitConfig.bundle_identifier_utf8 offset drift");
 #endif
@@ -376,8 +408,9 @@ typedef void (*RamaTcpClientReadDemandFn)(void* _Nullable context);
 ///     pointee requires.
 ///   * A callback body MUST NOT synchronously call back into this session
 ///     (`_cancel`, `_free`, `_on_client_close`, `_signal_*_drain`, …): the
-///     engine holds a non-reentrant lock across the dispatch, so re-entry
-///     deadlocks. Dispatch such work to another queue and return.
+///     engine holds a non-reentrant lifetime gate across dispatch, while the
+///     foreign wrapper can hold its own session-entry lock. Re-entry can invert
+///     those locks and deadlock. Dispatch such work to another queue and return.
 ///   * `bytes` passed to `on_server_bytes` is borrowed for the duration of the
 ///     call; the receiver MUST copy any data it needs to retain.
 typedef struct {
@@ -425,7 +458,7 @@ typedef struct {
 } RamaUdpPeerView;
 
 typedef void (*RamaUdpServerDatagramFn)(void* _Nullable context, RamaBytesView bytes, RamaUdpPeerView peer);
-typedef void (*RamaUdpClientReadDemandFn)(void* _Nullable context);
+typedef void (*RamaUdpClientReadDemandFn)(void* _Nullable context, uint64_t probe_id);
 typedef void (*RamaUdpServerClosedFn)(void* _Nullable context);
 
 /// Callbacks Swift provides for Rust UDP session events.
@@ -434,14 +467,18 @@ typedef void (*RamaUdpServerClosedFn)(void* _Nullable context);
 /// `RamaTransparentProxyTcpSessionCallbacks` above. Same rules apply here — the
 /// pointee must outlive the `*_free` call, callbacks may run on any thread, and
 /// `bytes` is borrowed for the duration of each call.
+/// The read-demand callback MUST only schedule the foreign read and return;
+/// it MUST NOT synchronously re-enter this session. A zero `probe_id` is an
+/// ordinary read demand. For a non-zero ID, after that read completes,
+/// ACK the exact ID first with
+/// `rama_transparent_proxy_udp_session_on_client_read_complete`, then submit
+/// every datagram from that completion with
+/// `rama_transparent_proxy_udp_session_on_client_datagram`. Delivery before the
+/// exact ACK is rejected and cannot consume the leased capacity.
 typedef struct {
-    /// Opaque user context passed back to callbacks. See lifetime contract above.
     void* context;
-    /// Called when Rust has one datagram to write to client-side UDP flow.
     RamaUdpServerDatagramFn on_server_datagram;
-    /// Called when Rust requests one client-side UDP read (`flow.readDatagrams`).
     RamaUdpClientReadDemandFn on_client_read_demand;
-    /// Called when Rust closes server-side UDP flow.
     RamaUdpServerClosedFn on_server_closed;
 } RamaTransparentProxyUdpSessionCallbacks;
 
@@ -498,21 +535,18 @@ typedef struct {
     /// Whether `linger_close_ms` carries a meaningful value;
     /// `false` ⇒ Swift uses its built-in default.
     bool has_linger_close_ms;
-    /// Wall-clock cap (ms) on how long the egress NWConnection lingers
-    /// after the local side has sent its FIN before Swift force-cancels
-    /// the connection. Without this watchdog a peer that fails to send
-    /// its own FIN-ACK keeps the socket pinned in FIN_WAIT_1 and the
-    /// macOS NECP flow registration alive, which compounds with new
-    /// flow starts into the path-evaluator slowdown.
+    /// Grace (ms) after a promoted flow reaches terminal before Swift
+    /// force-cancels its egress NWConnection. A successful local FIN alone
+    /// does not start this grace because the response half may remain quiet.
     uint32_t linger_close_ms;
     /// Whether `egress_eof_grace_ms` carries a meaningful value;
     /// `false` ⇒ Swift uses its built-in default.
     bool has_egress_eof_grace_ms;
-    /// Grace window (ms) between the egress read pump observing peer
-    /// EOF (or a read error) and the Swift side force-cancelling the
-    /// connection. Protects the path where the clean teardown
-    /// (`on_server_closed` → cancel) stalls because the originating
-    /// app stopped reading from its NEAppProxyFlow.
+    /// Grace window (ms) after an abnormal egress-read stop before the
+    /// Swift side force-cancels the connection. Covers read errors, a
+    /// vanished Swift session, or Rust dropping its egress consumer.
+    /// Clean peer EOF does not arm this short fallback because the
+    /// client-to-server half may legally remain quiet and resume later.
     uint32_t egress_eof_grace_ms;
     /// Enable TCP keepalive (NWProtocolTCP.Options.enableKeepalive). No
     /// `has_` flag — always meaningful, defaults true. Self-heals a
@@ -655,8 +689,10 @@ typedef uint8_t RamaPromoteConfirmStatus;
 /// `on_promote_request` fires when the in-Rust per-flow service
 /// calls `PromoteHandle::into_passthrough`. Swift drains its
 /// pending writers, atomically rewires the data path to bypass
-/// Rust, then ACKs by calling
-/// `rama_transparent_proxy_tcp_session_confirm_promoted`.
+/// Rust, then asynchronously ACKs by calling
+/// `rama_transparent_proxy_tcp_session_confirm_promoted`. The callback MUST
+/// queue-hop that work and return immediately; it must not make the
+/// same-session call synchronously. See the no-re-entry rule above.
 typedef void (*RamaTcpPromoteRequestFn)(void* _Nullable context);
 
 /// Callbacks passed to
@@ -695,6 +731,29 @@ bool rama_transparent_proxy_initialize(const RamaTransparentProxyInitConfig* _Nu
 /// Returns an owned pointer, or NULL on failure.
 /// Caller must release it with `rama_transparent_proxy_config_free`.
 RamaTransparentProxyConfig* _Nullable rama_transparent_proxy_get_config(RamaTransparentProxyEngine* engine);
+
+/// Effective UDP idle timeout used by this engine, in milliseconds.
+/// Zero means the builder disabled UDP idle expiration. Swift mirrors this
+/// value for its independent kernel-flow watchdog.
+uint64_t rama_transparent_proxy_engine_udp_idle_timeout_ms(
+    RamaTransparentProxyEngine* engine
+);
+
+size_t rama_transparent_proxy_engine_udp_channel_capacity(
+    RamaTransparentProxyEngine* engine
+);
+size_t rama_transparent_proxy_engine_udp_ingress_per_flow_max_bytes(
+    RamaTransparentProxyEngine* engine
+);
+size_t rama_transparent_proxy_engine_udp_ingress_global_max_bytes(
+    RamaTransparentProxyEngine* engine
+);
+size_t rama_transparent_proxy_engine_writer_memory_max_bytes(
+    RamaTransparentProxyEngine* engine
+);
+size_t rama_transparent_proxy_engine_writer_memory_max_items(
+    RamaTransparentProxyEngine* engine
+);
 
 /// Free a config previously returned by `rama_transparent_proxy_get_config`.
 ///
@@ -878,7 +937,8 @@ void rama_transparent_proxy_tcp_session_signal_egress_drain(
 ///
 /// After Swift completes the cutover it MUST call
 /// `rama_transparent_proxy_tcp_session_confirm_promoted` to
-/// resolve the pending future.
+/// resolve the pending future. The promote callback must queue-hop that work;
+/// it must not make the same-session call synchronously.
 ///
 /// NULL `session` is allowed and ignored.
 void rama_transparent_proxy_tcp_session_register_promote_callbacks(
@@ -934,10 +994,26 @@ void rama_transparent_proxy_udp_session_free(RamaTransparentProxyUdpSession* _Nu
 /// `peer.present = false` is allowed and is treated as "no peer
 /// attribution"; in production every kernel-delivered datagram comes
 /// with an endpoint.
+/// Admission is nonblocking and lossy: a full channel, exhausted byte budget,
+/// or paused session drops the datagram and emits sampled pressure telemetry.
+/// A global-pressure probe reserves one datagram, not its whole read batch;
+/// later datagrams require ordinary capacity and cannot bypass queued waiters.
 void rama_transparent_proxy_udp_session_on_client_datagram(
     RamaTransparentProxyUdpSession* session,
     RamaBytesView bytes,
     RamaUdpPeerView peer
+);
+
+/// ACK completion of the Apple read associated with `probe_id`. An exact ACK
+/// marks the read complete while preserving its charged admission credit until
+/// the owning datagram is consumed, the flow closes, or the bounded delivery
+/// grace expires. Zero and stale IDs are harmless no-ops and can never affect a
+/// newer provisional coordinator credit. Call this only after the foreign read
+/// callback completes, before submitting any datagram produced by that read;
+/// never call it synchronously from `on_client_read_demand`.
+void rama_transparent_proxy_udp_session_on_client_read_complete(
+    RamaTransparentProxyUdpSession* session,
+    uint64_t probe_id
 );
 
 /// Signal UDP flow closure from client side.

@@ -137,7 +137,17 @@ macro_rules! __transparent_proxy_ffi_emit {
                 Some(unsafe { &*config })
             };
 
-            ($init)(config)
+            match ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
+                ($init)(config)
+            })) {
+                Ok(initialized) => initialized,
+                Err(_) => {
+                    $crate::tproxy::log_engine_build_panic(
+                        "initialize transparent proxy application",
+                    );
+                    false
+                }
+            }
         }
 
         #[unsafe(no_mangle)]
@@ -153,6 +163,57 @@ macro_rules! __transparent_proxy_ffi_emit {
             let config = engine.transparent_proxy_config();
             let ffi_cfg = RamaTransparentProxyConfig::from_rust_type(&config);
             ::std::boxed::Box::into_raw(::std::boxed::Box::new(ffi_cfg))
+        }
+
+        #[unsafe(no_mangle)]
+        pub unsafe extern "C" fn rama_transparent_proxy_engine_udp_idle_timeout_ms(
+            engine: *mut RamaTransparentProxyEngine,
+        ) -> u64 {
+            if engine.is_null() {
+                return 0;
+            }
+            let engine = unsafe { &*engine };
+            engine.udp_idle_timeout_ms()
+        }
+
+        #[unsafe(no_mangle)]
+        pub unsafe extern "C" fn rama_transparent_proxy_engine_udp_channel_capacity(
+            engine: *mut RamaTransparentProxyEngine,
+        ) -> usize {
+            if engine.is_null() { return 0; }
+            unsafe { &*engine }.udp_channel_capacity()
+        }
+
+        #[unsafe(no_mangle)]
+        pub unsafe extern "C" fn rama_transparent_proxy_engine_udp_ingress_per_flow_max_bytes(
+            engine: *mut RamaTransparentProxyEngine,
+        ) -> usize {
+            if engine.is_null() { return 0; }
+            unsafe { &*engine }.udp_ingress_per_flow_max_bytes()
+        }
+
+        #[unsafe(no_mangle)]
+        pub unsafe extern "C" fn rama_transparent_proxy_engine_udp_ingress_global_max_bytes(
+            engine: *mut RamaTransparentProxyEngine,
+        ) -> usize {
+            if engine.is_null() { return 0; }
+            unsafe { &*engine }.udp_ingress_global_max_bytes()
+        }
+
+        #[unsafe(no_mangle)]
+        pub unsafe extern "C" fn rama_transparent_proxy_engine_writer_memory_max_bytes(
+            engine: *mut RamaTransparentProxyEngine,
+        ) -> usize {
+            if engine.is_null() { return 0; }
+            unsafe { &*engine }.writer_memory_max_bytes()
+        }
+
+        #[unsafe(no_mangle)]
+        pub unsafe extern "C" fn rama_transparent_proxy_engine_writer_memory_max_items(
+            engine: *mut RamaTransparentProxyEngine,
+        ) -> usize {
+            if engine.is_null() { return 0; }
+            unsafe { &*engine }.writer_memory_max_items()
         }
 
         #[unsafe(no_mangle)]
@@ -190,11 +251,21 @@ macro_rules! __transparent_proxy_ffi_emit {
                 }))
             };
 
-            let engine = match __rama_build_transparent_proxy_engine(opaque_config) {
-                Ok(engine) => engine,
-                Err(err) => {
+            let engine = match ::std::panic::catch_unwind(
+                ::std::panic::AssertUnwindSafe(|| {
+                    __rama_build_transparent_proxy_engine(opaque_config)
+                }),
+            ) {
+                Ok(Ok(engine)) => engine,
+                Ok(Err(err)) => {
                     $crate::tproxy::log_engine_build_error(
                         err.as_ref(),
+                        "create transparent proxy engine",
+                    );
+                    return ::std::ptr::null_mut();
+                }
+                Err(_) => {
+                    $crate::tproxy::log_engine_build_panic(
                         "create transparent proxy engine",
                     );
                     return ::std::ptr::null_mut();
@@ -470,7 +541,8 @@ macro_rules! __transparent_proxy_ffi_emit {
         /// Calling on a null session is a no-op.
         ///
         /// See [`RamaTransparentProxyTcpPromoteCallbacks`] for the
-        /// `context` lifetime / threading contract.
+        /// `context` lifetime / threading contract. Same-session FFI work must
+        /// be queue-hopped rather than called synchronously in the callback.
         #[unsafe(no_mangle)]
         pub unsafe extern "C" fn rama_transparent_proxy_tcp_session_register_promote_callbacks(
             session: *mut RamaTransparentProxyTcpSession,
@@ -612,9 +684,9 @@ macro_rules! __transparent_proxy_ffi_emit {
                         let _ = &peer_scratch;
                     },
                 ),
-                ::std::sync::Arc::new(move || {
+                ::std::sync::Arc::new(move |probe_id| {
                     if let Some(callback) = on_client_read_demand {
-                        unsafe { callback(context as *mut ::std::ffi::c_void) };
+                        unsafe { callback(context as *mut ::std::ffi::c_void, probe_id) };
                     }
                 }),
                 ::std::sync::Arc::new(move || {
@@ -672,6 +744,18 @@ macro_rules! __transparent_proxy_ffi_emit {
             let peer = unsafe { peer.into_socket_addr() };
             let slice = unsafe { bytes.into_slice() };
             unsafe { (*session).on_client_datagram(slice, peer) };
+        }
+
+        /// Mark a completed UDP read before submitting any datagram from
+        /// that completion. The demand callback must queue the foreign read
+        /// and return rather than synchronously re-entering this session.
+        #[unsafe(no_mangle)]
+        pub unsafe extern "C" fn rama_transparent_proxy_udp_session_on_client_read_complete(
+            session: *mut RamaTransparentProxyUdpSession,
+            probe_id: u64,
+        ) {
+            if session.is_null() { return; }
+            unsafe { (*session).on_client_read_complete(probe_id) };
         }
 
         #[unsafe(no_mangle)]

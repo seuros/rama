@@ -35,6 +35,7 @@ final class TcpDirectForwarderTests: XCTestCase {
         let clientWritePump: TcpClientWritePump
         let egressWritePump: NwTcpConnectionWritePump
         let forwarder: TcpDirectForwarder
+        let writerMemoryBudget: WriterMemoryBudget
         var terminalCount = 0
         /// Counts the forwarder's `onClosing` (first `.finishing`) and
         /// `onDrainStall` (wedged-finish backstop) callbacks. Read via
@@ -42,11 +43,14 @@ final class TcpDirectForwarderTests: XCTestCase {
         var closingCount = 0
         var drainPending = false
         var drainStallCount = 0
+        var readError: Error?
+        let drainIdleMs: TestValue<UInt64>
         /// Counts the forwarder's `onActivity` callback — fired on every
         /// byte moved in either direction. Production routes this to
-        /// `ctx.lastActivityAt` for the promoted-idle reaper. Mutated on
-        /// `queue`, read via `queue.sync`.
-        var activityCount = 0
+        /// `ctx.lastActivityAt` for the promoted-idle reaper. The callback
+        /// deliberately fires before queue normalization, so this counter is
+        /// independently locked even when an off-queue mock drives it.
+        let activityCount = TestValue(0)
         /// Background thread that auto-fires pending send
         /// completions on the mock connection. The egress
         /// write pump serialises sends — each `send` call
@@ -69,17 +73,32 @@ final class TcpDirectForwarderTests: XCTestCase {
         /// sends as they arrive — required by every test that
         /// expects normal `c2sPhase = .finished` progression.
         /// Backpressure tests pass `false` and trigger completions
-        /// manually so the egress pump's `pendingBytes` can
-        /// actually exceed `writePumpMaxPendingBytes` and
-        /// force `.paused`.
+        /// manually so the egress pump's `pendingBytes` stays at
+        /// `writePumpMaxPendingBytes` and forces the next bounded
+        /// prefix to return `.paused`.
         init(
             _ tag: String, preDrained: Bool = true, autoCompleter: Bool = true,
-            drainStallDeadline: DispatchTimeInterval = .milliseconds(Int(defaultLingerCloseMs))
+            drainStallDeadline: DispatchTimeInterval = .milliseconds(Int(defaultLingerCloseMs)),
+            initialDrainIdleMs: UInt64 = .max,
+            activityAllowed: Bool = true,
+            writeChunkLimit: Int = writePumpMaxPendingBytes,
+            onReceiveMaximumLength: (@Sendable (Int) -> Void)? = nil,
+            writerMemoryBudget: WriterMemoryBudget = WriterMemoryBudget()
         ) {
             let flow = MockTcpFlow()
             let conn = MockNwConnection()
+            let connection: any NwConnectionLike
+            if let onReceiveMaximumLength {
+                connection = ReceiveLengthObservingConnection(
+                    base: conn, observer: onReceiveMaximumLength)
+            } else {
+                connection = conn
+            }
+            let drainIdleClock = TestValue(initialDrainIdleMs)
             self.flow = flow
             self.conn = conn
+            self.drainIdleMs = drainIdleClock
+            self.writerMemoryBudget = writerMemoryBudget
             queue = DispatchQueue(label: "rama.tproxy.test.fwd.\(tag)", qos: .utility)
             // Move connection to .ready so the egress write pump
             // is willing to send. Real production wires this via
@@ -93,15 +112,16 @@ final class TcpDirectForwarderTests: XCTestCase {
                 flow: flow, queue: queue,
                 logger: { _ in },
                 onTerminalError: { _ in },
-                onDrained: { forwarderRef.get()?.onClientPumpDrained() })
+                onDrained: { forwarderRef.get()?.onClientPumpDrained() },
+                writerMemoryBudget: writerMemoryBudget)
             egressWritePump = NwTcpConnectionWritePump(
-                connection: conn, queue: queue,
-                lingerCloseDeadline: .milliseconds(100),
+                connection: connection, queue: queue,
                 onDrained: { forwarderRef.get()?.onEgressPumpDrained() },
                 // Mirror production's promoted-mode wiring
                 // (`TcpFlowSession.buildEgressWritePump`): a terminal
                 // egress write error drives the forwarder to terminal.
-                onTerminal: { _ in forwarderRef.get()?.cancel() })
+                onTerminal: { _ in forwarderRef.get()?.cancel() },
+                writerMemoryBudget: writerMemoryBudget)
             // Mark client write pump opened so it accepts enqueues.
             clientWritePump.markOpened()
 
@@ -109,18 +129,25 @@ final class TcpDirectForwarderTests: XCTestCase {
             var capturedClosingRef: (() -> Void)? = nil
             var capturedDrainPendingRef: ((Bool) -> Void)? = nil
             var capturedDrainStallRef: (() -> Void)? = nil
-            var capturedActivityRef: (() -> Void)? = nil
+            var capturedReadErrorRef: ((Error) -> Void)? = nil
+            let capturedActivityRef = TestValue<(@Sendable () -> Bool)?>(nil)
             self.forwarder = TcpDirectForwarder(
-                flow: flow, connection: conn,
+                flow: flow, connection: connection,
                 clientWritePump: clientWritePump,
                 egressWritePump: egressWritePump,
+                writerMemoryBudget: writerMemoryBudget,
                 queue: queue,
                 logger: { _ in },
                 drainStallDeadline: drainStallDeadline,
+                drainIdleMs: { [drainIdleClock] in drainIdleClock.get() },
                 onClosing: { capturedClosingRef?() },
                 onDrainPendingChanged: { capturedDrainPendingRef?($0) },
                 onDrainStall: { capturedDrainStallRef?() },
-                onActivity: { capturedActivityRef?() },
+                onReadError: { capturedReadErrorRef?($0) },
+                onActivity: {
+                    capturedActivityRef.get()?() ?? false
+                },
+                writeChunkLimit: writeChunkLimit,
                 closeClientWrite: { [flow] error in flow.closeWriteWithError(error) },
                 onTerminal: { capturedTerminalRef?() }
             )
@@ -137,7 +164,11 @@ final class TcpDirectForwarderTests: XCTestCase {
             capturedClosingRef = { [weak self] in self?.closingCount += 1 }
             capturedDrainPendingRef = { [weak self] in self?.drainPending = $0 }
             capturedDrainStallRef = { [weak self] in self?.drainStallCount += 1 }
-            capturedActivityRef = { [weak self] in self?.activityCount += 1 }
+            capturedReadErrorRef = { [weak self] in self?.readError = $0 }
+            capturedActivityRef.set { [weak self] in
+                self?.activityCount.update { $0 += 1 }
+                return activityAllowed
+            }
             if preDrained {
                 forwarder.markClientReadDrained()
                 forwarder.markEgressReadDrained()
@@ -194,6 +225,120 @@ final class TcpDirectForwarderTests: XCTestCase {
             "no connection.receive until S→C direction is `.active`")
         XCTAssertEqual(h.c2sPhase, .buffering)
         XCTAssertEqual(h.s2cPhase, .buffering)
+    }
+
+    func testManyFlowCarryoverBuffersShareOneExactProcessBound() {
+        let budget = WriterMemoryBudget(
+            policy: WriterMemoryPolicy(
+                maxBytes: 32,
+                maxItems: 4,
+                tcpWaiterMaxBytes: 8,
+                udpPressureReserveBytes: 0,
+                udpPressureReserveItems: 0))
+        let harnesses = (0..<12).map {
+            Harness(
+                "aggregate.carryover.\($0)",
+                preDrained: false,
+                autoCompleter: false,
+                writeChunkLimit: 8,
+                writerMemoryBudget: budget)
+        }
+
+        for harness in harnesses {
+            harness.forwarder.acceptClientCarryover(Data(repeating: 0xA5, count: 8))
+            harness.drain()
+            XCTAssertLessThanOrEqual(budget.snapshot().retainedBytes, 32)
+            XCTAssertLessThanOrEqual(budget.snapshot().retainedItems, 4)
+        }
+        XCTAssertEqual(budget.snapshot().retainedBytes, 24)
+        XCTAssertEqual(budget.snapshot().retainedItems, 3)
+        XCTAssertEqual(
+            harnesses.filter { harness in
+                harness.queue.sync { harness.readError != nil }
+            }.count,
+            9,
+            "TCP transit preserves one writer chunk outside its exact shared bound")
+
+        for harness in harnesses { harness.forwarder.cancel() }
+        for harness in harnesses { harness.drain() }
+        XCTAssertEqual(budget.snapshot().retainedBytes, 0)
+        XCTAssertEqual(budget.snapshot().retainedItems, 0)
+    }
+
+    func testBothCarryoverDirectionsTransferChargeWithoutLoss() {
+        let budget = WriterMemoryBudget(
+            policy: WriterMemoryPolicy(
+                maxBytes: 64,
+                maxItems: 16,
+                tcpWaiterMaxBytes: 8,
+                udpPressureReserveBytes: 8,
+                udpPressureReserveItems: 2))
+        let harness = Harness(
+            "aggregate.transfer",
+            preDrained: false,
+            writeChunkLimit: 4,
+            writerMemoryBudget: budget)
+        let c2s = Data([0, 1, 2, 3, 4, 5, 6])
+        let s2c = Data([10, 11, 12, 13, 14])
+
+        harness.forwarder.acceptClientCarryover(c2s)
+        harness.forwarder.acceptEgressCarryover(s2c)
+        harness.drain()
+        XCTAssertEqual(budget.snapshot().retainedBytes, c2s.count + s2c.count)
+        XCTAssertEqual(
+            budget.snapshot().retainedItems, 2,
+            "one item is charged per physical root, not per logical writer slice")
+
+        harness.forwarder.markRustC2SDone()
+        harness.forwarder.markRustS2CDone()
+        waitFor("both charged carryovers drain", timeout: 2.0) {
+            budget.snapshot().retainedBytes == 0
+        }
+        XCTAssertEqual(
+            Data(harness.conn.sentChunks.compactMap(\.content).joined()), c2s)
+        XCTAssertEqual(Data(harness.flow.writes.joined()), s2c)
+        XCTAssertNil(harness.queue.sync { harness.readError })
+    }
+
+    func testClientReadTransitChargeSurvivesBlockedQueueAndTransfersToWriter() {
+        let budget = WriterMemoryBudget(
+            policy: WriterMemoryPolicy(
+                maxBytes: 8,
+                maxItems: 2,
+                tcpWaiterMaxBytes: 4,
+                udpPressureReserveBytes: 0,
+                udpPressureReserveItems: 0))
+        let harness = Harness(
+            "aggregate.client-transit",
+            autoCompleter: false,
+            writeChunkLimit: 4,
+            writerMemoryBudget: budget)
+        harness.forwarder.markRustC2SDone()
+        waitFor("direct client read issued", timeout: 1.0) {
+            harness.flow.pendingReadCount == 1
+        }
+
+        let entered = DispatchSemaphore(value: 0)
+        let gate = DispatchSemaphore(value: 0)
+        harness.queue.async { entered.signal(); gate.wait() }
+        XCTAssertEqual(entered.wait(timeout: .now() + 1), .success)
+        harness.flow.completeRead(data: Data(repeating: 0xA5, count: 4), error: nil)
+        waitFor("callback transit charged", timeout: 1.0) {
+            budget.snapshot().retainedBytes == 4
+        }
+        XCTAssertNil(
+            budget.makeTcpTransitCursor(Data([1])),
+            "the transit subcap must preserve one writer chunk")
+
+        gate.signal()
+        waitFor("transit transferred into egress write", timeout: 1.0) {
+            harness.conn.sentChunks.count == 1
+        }
+        XCTAssertEqual(budget.snapshot().retainedBytes, 4)
+        XCTAssertTrue(harness.conn.completePendingSend(error: nil))
+        waitFor("transport completion retires transferred charge", timeout: 1.0) {
+            budget.snapshot().retainedBytes == 0
+        }
     }
 
     /// `markRustC2SDone` flushes the C→S carryover buffer to the
@@ -305,6 +450,105 @@ final class TcpDirectForwarderTests: XCTestCase {
         }
     }
 
+    func testActiveC2SReadSplitsPayloadAtConfiguredWriteCap() {
+        let cap = 3
+        let payload = Data([0, 1, 2, 3, 4, 5, 6, 7])
+        let h = Harness("active.c2s.cap", writeChunkLimit: cap)
+        h.forwarder.markRustC2SDone()
+        h.drain()
+
+        h.flow.completeRead(data: payload, error: nil)
+        waitFor("bounded C2S chunks reach connection", timeout: 2.0) {
+            let chunks = h.conn.sentChunks.compactMap(\.content)
+            return chunks.reduce(0) { $0 + $1.count } >= payload.count
+        }
+
+        let chunks = h.conn.sentChunks.compactMap(\.content)
+        XCTAssertEqual(chunks.map(\.count), [3, 3, 2])
+        XCTAssertTrue(chunks.allSatisfy { $0.count <= cap })
+        XCTAssertEqual(Data(chunks.joined()), payload)
+    }
+
+    func testActiveS2CReceiveUsesConfiguredCapAndDefensivelySplitsPayload() {
+        let cap = 3
+        let requestedMaximums = TestValue<[Int]>([])
+        let payload = Data([0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7])
+        let h = Harness(
+            "active.s2c.cap",
+            writeChunkLimit: cap,
+            onReceiveMaximumLength: { maximum in
+                requestedMaximums.update { $0.append(maximum) }
+            })
+        h.forwarder.markRustS2CDone()
+        h.drain()
+
+        XCTAssertEqual(requestedMaximums.get().first, cap)
+        // A conforming NWConnection will honor `maximumLength`; deliberately
+        // return more from the mock to keep the enqueue boundary defensive.
+        XCTAssertTrue(h.conn.completePendingReceive(
+            data: payload, isComplete: false, error: nil))
+        waitFor("bounded S2C chunks reach client flow", timeout: 2.0) {
+            h.flow.writes.reduce(0) { $0 + $1.count } >= payload.count
+        }
+
+        let chunks = h.flow.writes
+        XCTAssertEqual(chunks.map(\.count), [3, 3, 2])
+        XCTAssertTrue(chunks.allSatisfy { $0.count <= cap })
+        XCTAssertEqual(Data(chunks.joined()), payload)
+        XCTAssertTrue(requestedMaximums.get().allSatisfy { $0 == cap })
+    }
+
+    func testCutoverCarryoverSplitsBothDirectionsBeforeFinAndPreservesOrder() {
+        let cap = 2
+        let c2sPayload = Data([0x10, 0x11, 0x12, 0x13, 0x14])
+        let s2cPayload = Data([0x20, 0x21, 0x22, 0x23, 0x24, 0x25])
+        let h = Harness(
+            "carryover.both.cap",
+            preDrained: false,
+            writeChunkLimit: cap)
+
+        h.forwarder.acceptClientCarryover(c2sPayload)
+        h.forwarder.acceptClientCarryover(nil)
+        h.forwarder.acceptEgressCarryover(s2cPayload)
+        h.forwarder.acceptEgressCarryover(nil)
+        h.forwarder.markRustC2SDone()
+        h.forwarder.markRustS2CDone()
+
+        waitFor("bounded carryover drains before both FINs", timeout: 2.0) {
+            h.c2sPhase == .finished && h.s2cPhase == .finished
+        }
+
+        let c2sChunks = h.conn.sentChunks.compactMap(\.content)
+        let s2cChunks = h.flow.writes
+        XCTAssertEqual(c2sChunks.map(\.count), [2, 2, 1])
+        XCTAssertEqual(s2cChunks.map(\.count), [2, 2, 2])
+        XCTAssertTrue(c2sChunks.allSatisfy { $0.count <= cap })
+        XCTAssertTrue(s2cChunks.allSatisfy { $0.count <= cap })
+        XCTAssertEqual(Data(c2sChunks.joined()), c2sPayload)
+        XCTAssertEqual(Data(s2cChunks.joined()), s2cPayload)
+        XCTAssertEqual(h.flow.pendingReadCount, 0)
+        XCTAssertEqual(h.conn.pendingReceiveCount, 0)
+    }
+
+    func testServerReceiveOnFlowQueueProcessesInlineAndRearmsInOrder() {
+        let h = Harness("active.s2c.inline")
+        h.forwarder.markRustS2CDone()
+        h.drain()
+        XCTAssertEqual(h.conn.pendingReceiveCount, 1)
+
+        let payload = Data([0xD1, 0xD2])
+        h.queue.sync {
+            XCTAssertTrue(h.conn.completePendingReceive(
+                data: payload, isComplete: false, error: nil))
+            XCTAssertEqual(
+                h.conn.pendingReceiveCount, 1,
+                "the direct forwarder must rearm before an on-queue receive callback returns")
+        }
+        waitFor("inline payload reaches client flow", timeout: 1.0) {
+            h.flow.writes.contains(payload)
+        }
+    }
+
     /// Every byte moved in either direction fires `onActivity`.
     /// Production routes that to `ctx.lastActivityAt` so the
     /// promoted-idle reaper only drops genuinely-quiet flows; here we
@@ -315,18 +559,105 @@ final class TcpDirectForwarderTests: XCTestCase {
         h.forwarder.markRustS2CDone()
         h.drain()
         XCTAssertEqual(
-            h.queue.sync { h.activityCount }, 0, "no activity before any bytes move")
+            h.activityCount.get(), 0, "no activity before any bytes move")
 
         h.flow.completeRead(data: Data([0x01, 0x02]), error: nil)
         waitFor("C→S byte bumped activity", timeout: 1.0) {
-            h.queue.sync { h.activityCount } >= 1
+            h.activityCount.get() >= 1
         }
 
-        let afterC2S = h.queue.sync { h.activityCount }
+        let afterC2S = h.activityCount.get()
         _ = h.conn.completePendingReceive(data: Data([0xAA]), isComplete: false, error: nil)
         waitFor("S→C byte bumped activity", timeout: 1.0) {
-            h.queue.sync { h.activityCount } > afterC2S
+            h.activityCount.get() > afterC2S
         }
+    }
+
+    /// A promoted kernel read publishes activity at the transport callback
+    /// boundary, before its delivery block can wait behind pressure work on
+    /// the per-flow queue.
+    func testClientReadPublishesActivityBeforeFlowQueueDelivery() {
+        let h = Harness("activity.client.boundary")
+        h.forwarder.markRustC2SDone()
+        h.drain()
+        waitFor("direct client read", timeout: 1.0) { h.flow.pendingReadCount > 0 }
+
+        let blockerEntered = DispatchSemaphore(value: 0)
+        let releaseBlocker = DispatchSemaphore(value: 0)
+        h.queue.async {
+            blockerEntered.signal()
+            releaseBlocker.wait()
+        }
+        XCTAssertEqual(blockerEntered.wait(timeout: .now() + 1), .success)
+        defer { releaseBlocker.signal() }
+
+        h.flow.completeRead(data: Data([0x01]), error: nil)
+        waitFor("activity published ahead of queue delivery", timeout: 1.0) {
+            h.activityCount.get() == 1
+        }
+    }
+
+    /// The promoted network receive side has the same ordering guarantee.
+    func testServerReadPublishesActivityBeforeFlowQueueDelivery() {
+        let h = Harness("activity.server.boundary")
+        h.forwarder.markRustS2CDone()
+        h.drain()
+        waitFor("direct server receive", timeout: 1.0) {
+            h.conn.pendingReceiveCount > 0
+        }
+
+        let blockerEntered = DispatchSemaphore(value: 0)
+        let releaseBlocker = DispatchSemaphore(value: 0)
+        h.queue.async {
+            blockerEntered.signal()
+            releaseBlocker.wait()
+        }
+        XCTAssertEqual(blockerEntered.wait(timeout: .now() + 1), .success)
+
+        XCTAssertTrue(h.conn.completePendingReceive(
+            data: Data([0x02]), isComplete: false, error: nil))
+        XCTAssertEqual(h.activityCount.get(), 1)
+        XCTAssertEqual(
+            h.conn.pendingReceiveCount, 0,
+            "an off-queue mock completion must remain parked behind the flow queue")
+
+        releaseBlocker.signal()
+        waitFor("off-queue receive delivery and rearm", timeout: 1.0) {
+            h.conn.pendingReceiveCount == 1
+        }
+    }
+
+    func testRejectedClientReadIsNotForwardedOrRearmed() {
+        let h = Harness("activity.client.reject", activityAllowed: false)
+        h.forwarder.markRustC2SDone()
+        h.drain()
+        waitFor("direct client read", timeout: 1.0) { h.flow.pendingReadCount == 1 }
+
+        h.flow.completeRead(data: Data([0x01]), error: nil)
+        waitFor("activity rejection observed", timeout: 1.0) {
+            h.activityCount.get() == 1
+        }
+        h.drain()
+
+        XCTAssertTrue(h.conn.sentChunks.isEmpty)
+        XCTAssertEqual(h.flow.pendingReadCount, 0)
+    }
+
+    func testRejectedServerReadIsNotForwardedOrRearmed() {
+        let h = Harness("activity.server.reject", activityAllowed: false)
+        h.forwarder.markRustS2CDone()
+        h.drain()
+        waitFor("direct server receive", timeout: 1.0) {
+            h.conn.pendingReceiveCount == 1
+        }
+
+        XCTAssertTrue(h.conn.completePendingReceive(
+            data: Data([0x02]), isComplete: false, error: nil))
+        h.drain()
+
+        XCTAssertEqual(h.activityCount.get(), 1)
+        XCTAssertTrue(h.flow.writes.isEmpty)
+        XCTAssertEqual(h.conn.pendingReceiveCount, 0)
     }
 
     // MARK: - Finishing / terminal
@@ -361,6 +692,29 @@ final class TcpDirectForwarderTests: XCTestCase {
         }
     }
 
+    func testFinalServerPayloadLatchesTerminalBeforeDeliveryAndDoesNotRearm() {
+        let h = Harness("eof.conn.final.payload")
+        h.forwarder.markRustS2CDone()
+        h.drain()
+        XCTAssertEqual(h.conn.pendingReceiveCount, 1)
+
+        let tail = Data([0xFA, 0xCE])
+        h.queue.sync {
+            XCTAssertTrue(h.conn.completePendingReceive(
+                data: tail, isComplete: true, error: nil))
+            XCTAssertEqual(
+                h.conn.pendingReceiveCount, 0,
+                "terminal must be visible while the final payload drains")
+        }
+        waitFor("final server payload reaches client flow", timeout: 1.0) {
+            h.flow.writes.contains(tail)
+        }
+        h.drain()
+        XCTAssertEqual(
+            h.conn.pendingReceiveCount, 0,
+            "a final payload must not trigger a redundant post-terminal receive")
+    }
+
     /// Both directions finished → onTerminal fires exactly once.
     func testBothDirectionsFinishedFiresTerminalOnce() {
         let h = Harness("both.finished")
@@ -392,6 +746,7 @@ final class TcpDirectForwarderTests: XCTestCase {
         XCTAssertEqual(h.terminalCount, 1)
         XCTAssertEqual(h.c2sPhase, .finished)
         XCTAssertEqual(h.s2cPhase, .finished)
+
     }
 
     /// Double cancel is a no-op on the second call.
@@ -693,52 +1048,151 @@ final class TcpDirectForwarderTests: XCTestCase {
 
     // MARK: - Phased ordering: kernel EOF arrives during read
 
-    /// Kernel error (NSError) closes C→S the same as EOF.
-    /// Treating errors as "direction done" is the contract for
-    /// the direct-forward path.
-    func testKernelReadErrorFinishesC2SDirection() {
+    /// Kernel read errors are fatal and retain their identity. Treating this
+    /// as EOF would eventually present the reset client flow as a clean close.
+    func testKernelReadErrorTerminatesWithOriginalError() {
         let h = Harness("kernel.error")
         h.forwarder.markRustC2SDone()
         h.drain()
 
         let err = NSError(domain: "test.fwd", code: 7)
         h.flow.completeRead(data: nil, error: err)
-        waitFor("c2s finished on error", timeout: 1.0) {
-            h.c2sPhase == .finished
+        waitFor("fatal read error surfaced", timeout: 1.0) {
+            h.queue.sync { h.readError != nil }
         }
+        XCTAssertEqual((h.queue.sync { h.readError } as NSError?)?.domain, "test.fwd")
+        XCTAssertEqual((h.queue.sync { h.readError } as NSError?)?.code, 7)
+        XCTAssertEqual(h.c2sPhase, .finished)
+        XCTAssertEqual(h.s2cPhase, .finished)
+        XCTAssertEqual(h.queue.sync { h.terminalCount }, 0)
     }
 
-    /// NWConnection receive error closes S→C the same as EOF.
-    func testConnectionReceiveErrorFinishesS2CDirection() {
+    func testClientCarryoverReadErrorTerminatesWithOriginalError() {
+        let h = Harness("kernel.carryover.error")
+        let error = NSError(domain: "test.cutover", code: 11)
+
+        h.forwarder.acceptClientCarryoverError(error)
+
+        waitFor("cutover read error surfaced", timeout: 1.0) {
+            h.queue.sync { h.readError != nil }
+        }
+        XCTAssertEqual((h.queue.sync { h.readError } as NSError?)?.domain, "test.cutover")
+        XCTAssertEqual((h.queue.sync { h.readError } as NSError?)?.code, 11)
+        XCTAssertEqual(h.c2sPhase, .finished)
+        XCTAssertEqual(h.s2cPhase, .finished)
+    }
+
+    /// An egress receive error is a full-flow hard stop, not a clean S→C
+    /// half-close. A quiet client upload must not keep the flow registered.
+    func testConnectionReceiveErrorTerminatesQuietOppositeDirection() {
         let h = Harness("conn.error")
+        h.forwarder.markRustC2SDone()
         h.forwarder.markRustS2CDone()
         h.drain()
+        XCTAssertEqual(h.flow.pendingReadCount, 1, "opposite upload is quiet")
 
         _ = h.conn.completePendingReceive(
             data: nil, isComplete: false,
             error: NWError.posix(.ECONNRESET))
-        waitFor("s2c finished on error", timeout: 2.0) {
-            h.s2cPhase == .finished
+        waitFor("full flow terminates on egress error", timeout: 2.0) {
+            h.queue.sync { h.readError != nil }
         }
         guard case .posix(.ECONNRESET)? = h.flow.lastCloseWriteError as? NWError else {
             return XCTFail("connection reset error was not forwarded")
         }
+        let ownerError = h.queue.sync(execute: { h.readError })
+        guard case .posix(.ECONNRESET)? = ownerError as? NWError else {
+            return XCTFail("owner did not receive the original reset")
+        }
+        XCTAssertEqual(h.c2sPhase, .finished)
+        XCTAssertEqual(h.s2cPhase, .finished)
+        XCTAssertEqual(h.queue.sync { h.terminalCount }, 0)
     }
 
     func testCarryoverErrorFinishesS2CWithError() {
         let h = Harness("carryover.error")
         let error = NSError(domain: "test.carryover", code: 19)
 
+        h.forwarder.acceptClientCarryover(Data([0xAA]))
+        h.drain()
+        XCTAssertEqual(
+            h.queue.sync { h.forwarder.testBufferedChunkCount }, 1)
         h.forwarder.acceptEgressCarryoverError(error)
         h.forwarder.acceptEgressCarryover(.none)
         h.forwarder.markRustS2CDone()
 
-        waitFor("s2c finished with carryover error", timeout: 2.0) {
-            h.s2cPhase == .finished
+        waitFor("carryover error reaches full teardown", timeout: 2.0) {
+            h.queue.sync { h.readError != nil }
         }
         let observed = h.flow.lastCloseWriteError as NSError?
         XCTAssertEqual(observed?.domain, error.domain)
         XCTAssertEqual(observed?.code, error.code)
+        XCTAssertEqual(h.c2sPhase, .finished)
+        XCTAssertEqual(h.s2cPhase, .finished)
+        XCTAssertEqual(
+            h.queue.sync { h.forwarder.testBufferedChunkCount }, 0,
+            "fatal cutover error must release undeliverable carryover")
+    }
+
+    func testConnectionErrorDrainsTailBeforeFullTeardown() {
+        let h = Harness("conn.error.tail")
+        h.flow.captureWriteCompletions = true
+        h.forwarder.markRustC2SDone()
+        h.forwarder.markRustS2CDone()
+        h.drain()
+
+        let tail = Data([0xCA, 0xFE])
+        _ = h.conn.completePendingReceive(
+            data: tail,
+            isComplete: false,
+            error: NWError.posix(.ECONNRESET))
+        waitFor("terminal tail enters client writer", timeout: 1.0) {
+            h.flow.pendingWriteCompletionCount == 1
+        }
+        XCTAssertNil(h.queue.sync { h.readError })
+        XCTAssertEqual(h.flow.writes, [tail])
+        XCTAssertEqual(
+            h.conn.pendingReceiveCount, 0,
+            "an error-bearing final payload must not rearm the server receive")
+
+        XCTAssertTrue(h.flow.completeNextWrite())
+        waitFor("tail drain escalates original error", timeout: 1.0) {
+            h.queue.sync { h.readError != nil }
+        }
+        guard case .posix(.ECONNRESET)? = h.flow.lastCloseWriteError as? NWError else {
+            return XCTFail("tail drain did not preserve the reset")
+        }
+        XCTAssertEqual(h.c2sPhase, .finished)
+        XCTAssertEqual(h.s2cPhase, .finished)
+    }
+
+    func testConnectionErrorBoundsStalledTailDespiteOppositeActivity() {
+        let h = Harness(
+            "conn.error.stalled.tail",
+            drainStallDeadline: .milliseconds(60),
+            initialDrainIdleMs: 0)
+        h.flow.captureWriteCompletions = true
+        h.forwarder.markRustC2SDone()
+        h.forwarder.markRustS2CDone()
+        h.drain()
+
+        _ = h.conn.completePendingReceive(
+            data: Data([0xBA, 0xDD]),
+            isComplete: false,
+            error: NWError.posix(.ECONNRESET))
+        waitFor("terminal tail stalls in client writer", timeout: 1.0) {
+            h.flow.pendingWriteCompletionCount == 1
+        }
+
+        waitFor("fixed abnormal deadline tears down flow", timeout: 1.0) {
+            h.queue.sync { h.readError != nil }
+        }
+        let ownerError = h.queue.sync(execute: { h.readError })
+        guard case .posix(.ECONNRESET)? = ownerError as? NWError else {
+            return XCTFail("stalled tail teardown lost the reset")
+        }
+        XCTAssertEqual(h.c2sPhase, .finished)
+        XCTAssertEqual(h.s2cPhase, .finished)
     }
 
     // MARK: - Markers without data
@@ -844,40 +1298,34 @@ final class TcpDirectForwarderTests: XCTestCase {
     /// pump's drain edge (`onEgressPumpDrained`).
     ///
     /// We exercise this through the carryover-flush path because
-    /// it's the only one where two enqueues land synchronously
-    /// inside a single queue block (the forwarder's
-    /// `flushC2SBufferLocked` `while` loop). That keeps the pump's
-    /// `pendingBytes` accumulating: chunk 1 is accepted and bumps
-    /// `pendingBytes` to its size; chunk 2 hits the cap before
-    /// the pump's async dispatch can dequeue chunk 1.
+    /// an oversized source callback is now emitted as bounded prefixes.
+    /// The first prefix fills the byte budget; its retained remainder pauses
+    /// until the pump's drain edge re-enters the forwarder.
     ///
     /// The fix is unified across every `enqueue` call site
     /// (`writeC2SLocked` is the single entry point), so coverage
     /// of one site suffices for the design.
     func testActiveC2SBufferedReplayUnderBackpressure() {
         let h = Harness("backpressure.c2s.carryover", autoCompleter: false)
-        // Sized to exceed `writePumpMaxPendingBytes` (256 KiB
-        // default). The first chunk passes via the "first chunk
-        // always accepts" invariant; the second pushes
-        // `pendingBytes + data.count` over the cap → `.paused`.
+        let viewLimit = min(64 * 1024, writePumpMaxPendingBytes)
+        // Sized to exceed the write-pump cap and several bounded physical-root
+        // views, forcing one source cursor to retain a post-prefix remainder.
         let big = Data(repeating: 0xAB, count: 300 * 1024)
         let small = Data([0xCD, 0xEF])
 
         // Pre-cutover: both chunks land in `c2sBuffer`.
         h.forwarder.acceptClientCarryover(big)
         h.forwarder.acceptClientCarryover(small)
-        // Transition: synchronous flush. enqueue(big) → accepted,
-        // pendingBytes = 300 KiB. enqueue(small) → paused, set
-        // pausedSignaled. Loop exits with c2sWritePaused = true
-        // and `small` still at the head of `c2sBuffer`.
+        // Transition: bounded views fill the pump budget. `small` remains
+        // ordered behind that same source callback.
         h.forwarder.markRustC2SDone()
-        // The pump's flush of `big` happens on an async block
+        // The pump's flush of the first prefix happens on an async block
         // queued AFTER our `drain()` barrier, so a `waitFor` is
         // the only way to observe the send. After it fires, run
         // a second `drain` to let the drain-edge → forwarder
         // re-enqueue path settle.
-        waitFor("first chunk reached the wire", timeout: 1.0) {
-            h.conn.sentChunks.contains(where: { $0.content == big })
+        waitFor("first bounded prefix reached the wire", timeout: 1.0) {
+            h.conn.sentChunks.first?.content?.count == viewLimit
         }
         h.drain()
 
@@ -890,27 +1338,27 @@ final class TcpDirectForwarderTests: XCTestCase {
             "second chunk MUST be buffered, not dropped (pre-fix bug)"
         )
 
-        // Complete the in-flight send. Pump's `flush` completion
-        // callback fires `writing = false` then re-enters flush;
-        // since `pending` is non-empty (we pushed `big` into
-        // `pump.pending` via the async path before the test
-        // observed the drain), the pump drains it. The drain edge
-        // — triggered by `pausedSignaled` going false on a
-        // pendingBytes drop — calls `forwarder.onEgressPumpDrained`,
-        // which calls `flushC2SBufferLocked`, which retries `small`
-        // (now accepted) and routes it to `conn.send`.
-        _ = h.conn.completePendingSend(error: nil)
-        waitFor("buffered chunk replayed after drain", timeout: 2.0) {
-            h.conn.sentChunks.contains(where: { $0.content == small })
+        let expectedWrites = (big.count + viewLimit - 1) / viewLimit + 1
+        while h.conn.sentChunks.count < expectedWrites {
+            let previous = h.conn.sentChunks.count
+            XCTAssertTrue(h.conn.completePendingSend(error: nil))
+            waitFor("next bounded cursor view reached the wire", timeout: 2.0) {
+                h.conn.sentChunks.count > previous
+            }
+            // waitFor records a failure but returns after its deadline.
+            guard h.conn.sentChunks.count > previous else { return }
         }
-        // Drain the second send so the pump's lifecycle wraps up.
-        _ = h.conn.completePendingSend(error: nil)
+        XCTAssertTrue(h.conn.completePendingSend(error: nil))
         h.drain()
+
+        let chunks = h.conn.sentChunks.compactMap(\.content)
+        XCTAssertTrue(chunks.allSatisfy { $0.count <= viewLimit })
+        XCTAssertEqual(Data(chunks.joined()), big + small)
     }
 
     /// S→C mirror of `testActiveC2SBufferedReplayUnderBackpressure`: the
-    /// client write pump (kernel-bound) rejects an over-cap chunk with
-    /// `.paused`, the forwarder holds it, and the pump's drain edge replays
+    /// client write pump (kernel-bound) accepts one cap-sized prefix, returns
+    /// `.paused` for the retained remainder, and the pump's drain edge replays
     /// it — none dropped. The audit flagged the entire S→C backpressure
     /// path (`flushS2CBufferLocked` paused-latch + `onClientPumpDrained`
     /// replay) as untested; only C→S was covered.
@@ -919,32 +1367,40 @@ final class TcpDirectForwarderTests: XCTestCase {
         // Hold the client (S→C) writes in flight so `pendingBytes` stays high
         // and the second chunk pauses.
         h.flow.captureWriteCompletions = true
+        let viewLimit = min(64 * 1024, writePumpMaxPendingBytes)
         let big = Data(repeating: 0xAB, count: 300 * 1024)
         let small = Data([0xCD, 0xEF])
 
         // Pre-cutover: both chunks land in `s2cBuffer`.
         h.forwarder.acceptEgressCarryover(big)
         h.forwarder.acceptEgressCarryover(small)
-        // Transition: enqueue(big) → accepted (first-chunk rule);
-        // enqueue(small) → paused; loop exits with `small` held.
+        // Transition: a cap-sized prefix is accepted, and the remainder plus
+        // `small` stay ordered behind it.
         h.forwarder.markRustS2CDone()
 
-        waitFor("first chunk reached the kernel flow", timeout: 1.0) {
-            h.flow.writes.contains(big)
+        waitFor("first bounded prefix reached the kernel flow", timeout: 1.0) {
+            h.flow.writes.first?.count == viewLimit
         }
         h.drain()
         XCTAssertEqual(h.flow.pendingWriteCompletionCount, 1, "exactly the first chunk in flight")
         XCTAssertFalse(
             h.flow.writes.contains(small), "second chunk MUST be buffered, not dropped")
 
-        // Complete the in-flight write → drain edge → onClientPumpDrained →
-        // flushS2CBufferLocked replays `small`.
-        _ = h.flow.completeNextWrite()
-        waitFor("buffered chunk replayed after drain", timeout: 2.0) {
-            h.flow.writes.contains(small)
+        let expectedWrites = (big.count + viewLimit - 1) / viewLimit + 1
+        while h.flow.writes.count < expectedWrites {
+            let previous = h.flow.writes.count
+            XCTAssertTrue(h.flow.completeNextWrite())
+            waitFor("next bounded cursor view reached the kernel flow", timeout: 2.0) {
+                h.flow.writes.count > previous
+            }
+            // A stalled replay must not start another failed wait forever.
+            guard h.flow.writes.count > previous else { return }
         }
-        _ = h.flow.completeNextWrite()
+        XCTAssertTrue(h.flow.completeNextWrite())
         h.drain()
+
+        XCTAssertTrue(h.flow.writes.allSatisfy { $0.count <= viewLimit })
+        XCTAssertEqual(Data(h.flow.writes.joined()), big + small)
     }
 
     // MARK: - PROBE: egress write-pump terminal while C→S paused
@@ -973,17 +1429,16 @@ final class TcpDirectForwarderTests: XCTestCase {
         let h = Harness("probe.egress.terminal.paused", autoCompleter: false)
 
         // ── C→S: drive into .active with a paused, buffered chunk. ──
-        // `big` > writePumpMaxPendingBytes (256 KiB) so the FIRST
-        // chunk is accepted (first-chunk-always-passes) and bumps
-        // pendingBytes over the cap; `small` is then rejected `.paused`
-        // and parked at the head of c2sBuffer with c2sWritePaused=true.
+        // `big` > writePumpMaxPendingBytes (256 KiB), so its first bounded
+        // prefix fills the pump budget. The retained remainder is rejected
+        // `.paused`, with `small` still ordered behind it in c2sBuffer.
         let big = Data(repeating: 0xAB, count: 300 * 1024)
         let small = Data([0xCD, 0xEF])
         h.forwarder.acceptClientCarryover(big)
         h.forwarder.acceptClientCarryover(small)
         h.forwarder.markRustC2SDone()
         h.drain()
-        waitFor("big chunk dispatched to connection", timeout: 1.0) {
+        waitFor("first bounded prefix dispatched to connection", timeout: 1.0) {
             h.conn.pendingSendCount == 1
         }
 
@@ -997,7 +1452,7 @@ final class TcpDirectForwarderTests: XCTestCase {
         }
 
         // ── Kill the egress write pump via a NON-transient send error
-        //    while big is in flight. This terminates the pump core
+        //    while the first prefix is in flight. This terminates the pump core
         //    (`didTerminateWith`) while C→S is paused. ──
         _ = h.conn.completePendingSend(error: NWError.posix(.ECONNREFUSED))
         h.drain()
@@ -1048,6 +1503,38 @@ final class TcpDirectForwarderTests: XCTestCase {
             h.queue.sync { h.closingCount }, 1,
             "onClosing fires once when the first direction begins finishing")
         waitFor("drain backstop fires onDrainStall", timeout: 1.0) {
+            h.queue.sync { h.drainStallCount } == 1
+        }
+    }
+
+    func testS2CDrainBackstopDefersWhileTransportMakesProgress() {
+        let h = Harness(
+            "s2c.progress",
+            drainStallDeadline: .milliseconds(40),
+            initialDrainIdleMs: 0)
+        h.flow.captureWriteCompletions = true
+
+        h.forwarder.markRustS2CDone()
+        waitFor("s2c receive issued", timeout: 1.0) {
+            h.conn.pendingReceiveCount >= 1
+        }
+        _ = h.conn.completePendingReceive(
+            data: Data([1, 2, 3]), isComplete: false)
+        waitFor("next s2c receive issued", timeout: 1.0) {
+            h.conn.pendingReceiveCount >= 1
+        }
+        _ = h.conn.completePendingReceive(data: nil, isComplete: true)
+        waitFor("s2c drain pending", timeout: 1.0) {
+            h.s2cPhase == .finishing
+        }
+
+        Thread.sleep(forTimeInterval: 0.16)
+        XCTAssertEqual(
+            h.queue.sync { h.drainStallCount }, 0,
+            "recent transport progress must re-arm the drain deadline")
+
+        h.drainIdleMs.set(.max)
+        waitFor("quiet drain trips backstop", timeout: 1.0) {
             h.queue.sync { h.drainStallCount } == 1
         }
     }
@@ -1135,4 +1622,58 @@ private final class AtomicBool {
     private var _v: Bool = false
     func load() -> Bool { lock.lock(); defer { lock.unlock() }; return _v }
     func store(_ x: Bool) { lock.lock(); _v = x; lock.unlock() }
+}
+
+/// Narrow decorator used only to verify the forwarder's receive request. The
+/// shared mock remains the driver/inspection surface for all other behavior.
+private final class ReceiveLengthObservingConnection: NwConnectionLike, @unchecked Sendable {
+    private let base: MockNwConnection
+    private let observer: @Sendable (Int) -> Void
+
+    init(base: MockNwConnection, observer: @escaping @Sendable (Int) -> Void) {
+        self.base = base
+        self.observer = observer
+    }
+
+    var state: NWConnection.State { base.state }
+
+    var stateUpdateHandler: (@Sendable (NWConnection.State) -> Void)? {
+        get { base.stateUpdateHandler }
+        set { base.stateUpdateHandler = newValue }
+    }
+
+    var viabilityUpdateHandler: (@Sendable (Bool) -> Void)? {
+        get { base.viabilityUpdateHandler }
+        set { base.viabilityUpdateHandler = newValue }
+    }
+
+    func start(queue: DispatchQueue) { base.start(queue: queue) }
+    func cancel() { base.cancel() }
+
+    func send(
+        content: Data?,
+        contentContext: NWConnection.ContentContext,
+        isComplete: Bool,
+        completion: NWConnection.SendCompletion
+    ) {
+        base.send(
+            content: content,
+            contentContext: contentContext,
+            isComplete: isComplete,
+            completion: completion)
+    }
+
+    func receive(
+        minimumIncompleteLength: Int,
+        maximumLength: Int,
+        completion: @escaping @Sendable (
+            Data?, NWConnection.ContentContext?, Bool, NWError?
+        ) -> Void
+    ) {
+        observer(maximumLength)
+        base.receive(
+            minimumIncompleteLength: minimumIncompleteLength,
+            maximumLength: maximumLength,
+            completion: completion)
+    }
 }

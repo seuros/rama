@@ -1,6 +1,10 @@
 import Foundation
 import RamaAppleNEFFI
 
+func clampedFFISizeToInt<T: BinaryInteger>(_ value: T) -> Int {
+    Int(clamping: value)
+}
+
 struct RamaTransparentProxyFlowMetaBridge {
     var protocolRaw: UInt32
     var remoteHost: String?
@@ -38,14 +42,26 @@ struct RamaTransparentProxyConfigBridge {
     var tunnelRemoteAddress: String
     var rules: [RamaTransparentProxyRuleBridge]
     /// Per-flow TCP write-pump back-pressure cap in bytes.
-    /// Authoritative — `startProxy` assigns this verbatim to
-    /// `writePumpMaxPendingBytes`. The Rust engine guarantees a
-    /// non-zero default via its builder, so the Swift-side initial
-    /// value is never consulted in practice.
+    /// Authoritative — `startProxy` captures this in the immutable policy
+    /// attached with the engine. The Rust engine guarantees a non-zero
+    /// default via its builder.
     var tcpWritePumpMaxPendingBytes: Int
     var flowPressureSoftCap: UInt32
     var flowPressureLowWater: UInt32
     var flowPressureIdleFloorMs: UInt32
+    var liveFlowHardCap: UInt32
+    /// Effective builder-owned UDP idle timeout. Zero disables both the Rust
+    /// service timer and Swift's independent kernel-flow watchdog.
+    var udpIdleTimeoutMs: UInt64 = 60_000
+    /// Effective Rust UDP ingress limits. Swift mirrors these exactly for the
+    /// pre-queue Apple callback staging bound of the same engine generation.
+    var udpChannelCapacity: Int = 32
+    var udpIngressPerFlowMaxBytes: Int = 256 * 1024
+    var udpIngressGlobalMaxBytes: Int = 16 * 1024 * 1024
+    /// Exact process/core-lifetime payload and item envelope shared by every Swift
+    /// TCP and UDP writer. This remains enabled when live-flow hardCap is zero.
+    var writerMemoryMaxBytes: Int = WriterMemoryPolicy.default.maxBytes
+    var writerMemoryMaxItems: Int = WriterMemoryPolicy.default.maxItems
     var tcpStartInFlightHardCap: UInt32
     var tcpStartInFlightSoftCap: UInt32
     var tcpStartLatencyBreakerP95Ms: UInt32
@@ -60,9 +76,14 @@ struct RamaTransparentProxyConfigBridge {
 }
 
 /// Log and decide fail-open (passthrough) vs fail-closed (blocked) for a flow the
-/// provider declines for its own reasons. Driven by `defaultFlowRefusalPassthrough`.
-func failOpenOnFlowRefusal(_ reason: String) -> Bool {
-    let passthrough = defaultFlowRefusalPassthrough
+/// provider declines for its own reasons. Production callers pass the policy
+/// captured by their engine lease; the default preserves direct FFI unit tests.
+func failOpenOnFlowRefusal(
+    _ reason: String,
+    policy: FlowRefusalPolicy = FlowRefusalPolicy(
+        passthrough: defaultFlowRefusalPassthrough)
+) -> Bool {
+    let passthrough = policy.isPassthrough
     NSLog(
         "RamaFFI: \(reason); \(passthrough ? "passing flow through (fail open)" : "blocking flow (fail closed)")"
     )
@@ -163,13 +184,17 @@ final class UdpSessionCallbackBox {
     /// `flow.writeDatagrams`, which preserves per-datagram peer
     /// attribution all the way back to the kernel. `nil` is the
     /// safety valve for paths without attribution.
-    let onServerDatagram: (Data, RamaUdpPeer?) -> Void
-    let onClientReadDemand: () -> Void
+    /// Both views are borrowed from Rust and valid only for this synchronous
+    /// callback. The consumer must copy accepted payload/peer data before it
+    /// returns. Keeping the views raw lets the bounded writer reject overload
+    /// without first allocating and copying a datagram that it will drop.
+    let onServerDatagram: (RamaBytesView, RamaUdpPeerView) -> Void
+    let onClientReadDemand: (UInt64) -> Void
     let onServerClosed: () -> Void
 
     init(
-        onServerDatagram: @escaping (Data, RamaUdpPeer?) -> Void,
-        onClientReadDemand: @escaping () -> Void,
+        onServerDatagram: @escaping (RamaBytesView, RamaUdpPeerView) -> Void,
+        onClientReadDemand: @escaping (UInt64) -> Void,
         onServerClosed: @escaping () -> Void
     ) {
         self.onServerDatagram = onServerDatagram
@@ -196,6 +221,62 @@ final class TcpPromoteCallbackBox {
     init(onPromoteRequest: @escaping () -> Void) {
         self.onPromoteRequest = onPromoteRequest
     }
+}
+
+/// Swift-visible publication / retirement gate for the raw promote callback
+/// context handed to Rust.
+///
+/// Rust's `callback_active` mutex remains the load-bearing lifetime guarantee:
+/// registration and session teardown cannot complete while a promote callback
+/// is in flight. The linked Rust static library is not TSan-instrumented,
+/// however, so Swift's ThreadSanitizer cannot observe that happens-before edge.
+/// This gate mirrors ARC visibility on the instrumented side; Rust's
+/// `callback_active` remains responsible for raw-pointer publication and swap:
+///
+/// - callback boxes are initialized and retained while holding the gate;
+/// - the C trampoline takes a temporary +1 while holding the gate;
+/// - replaced / final owner +1s are transferred back to ARC while holding the
+///   gate, then released after unlocking.
+///
+/// Never hold this gate across a Rust FFI call or the user callback. That would
+/// invert with Rust's `callback_active` mutex or serialize arbitrary callback
+/// work globally.
+private let tcpPromoteCallbackContextGate = NSLock()
+
+private func makeTcpPromoteCallbackBox(
+    onPromoteRequest: @escaping () -> Void
+) -> Unmanaged<TcpPromoteCallbackBox> {
+    tcpPromoteCallbackContextGate.lock()
+    let box = Unmanaged.passRetained(
+        TcpPromoteCallbackBox(onPromoteRequest: onPromoteRequest))
+    tcpPromoteCallbackContextGate.unlock()
+    return box
+}
+
+private func retainTcpPromoteCallbackBox(
+    from context: UnsafeMutableRawPointer
+) -> TcpPromoteCallbackBox {
+    tcpPromoteCallbackContextGate.lock()
+    let box = Unmanaged<TcpPromoteCallbackBox>
+        .fromOpaque(context)
+        .retain()
+        .takeRetainedValue()
+    tcpPromoteCallbackContextGate.unlock()
+    return box
+}
+
+private func retireTcpPromoteCallbackBox(
+    _ box: Unmanaged<TcpPromoteCallbackBox>?
+) {
+    guard let box else { return }
+
+    tcpPromoteCallbackContextGate.lock()
+    let ownedBox = box.takeRetainedValue()
+    tcpPromoteCallbackContextGate.unlock()
+
+    // Keep destruction (and arbitrary captured-value deinits) outside the
+    // global gate while making the post-unlock release point explicit.
+    withExtendedLifetime(ownedBox) {}
 }
 
 /// Bridge-level mirror of `RamaPromoteConfirmStatus`.
@@ -227,7 +308,7 @@ final class TcpEgressCallbackBox {
     }
 }
 
-private func dataFromView(_ view: RamaBytesView) -> Data {
+func dataFromView(_ view: RamaBytesView) -> Data {
     guard let ptr = view.ptr, view.len > 0 else {
         return Data()
     }
@@ -240,7 +321,7 @@ private func dataFromView(_ view: RamaBytesView) -> Data {
 /// or empty, or when the bytes don't form valid UTF-8. The Rust
 /// side guarantees UTF-8 for all peers it emits, so a failure here
 /// is treated the same as `present == false` (no attribution).
-private func peerFromView(_ view: RamaUdpPeerView) -> RamaUdpPeer? {
+func peerFromView(_ view: RamaUdpPeerView) -> RamaUdpPeer? {
     guard view.present, let ptr = view.host_utf8, view.host_utf8_len > 0 else {
         return nil
     }
@@ -414,11 +495,10 @@ private let ramaUdpOnServerDatagramCallback:
     ) -> Void = { context, view, peerView in
         guard let context else { return }
         let box = Unmanaged<UdpSessionCallbackBox>.fromOpaque(context).takeUnretainedValue()
-        let data = dataFromView(view)
         // RFC 768: zero-length UDP datagrams are valid; forward
         // unchanged. The matching filter on TCP (`onServerBytes`)
         // is correct because an empty TCP read is a non-event.
-        box.onServerDatagram(data, peerFromView(peerView))
+        box.onServerDatagram(view, peerView)
     }
 
 private let ramaUdpOnServerClosedCallback: @convention(c) (UnsafeMutableRawPointer?) -> Void = {
@@ -428,11 +508,12 @@ private let ramaUdpOnServerClosedCallback: @convention(c) (UnsafeMutableRawPoint
     box.onServerClosed()
 }
 
-private let ramaUdpOnClientReadDemandCallback: @convention(c) (UnsafeMutableRawPointer?) -> Void =
-    { context in
+private let ramaUdpOnClientReadDemandCallback:
+    @convention(c) (UnsafeMutableRawPointer?, UInt64) -> Void =
+    { context, probeId in
         guard let context else { return }
         let box = Unmanaged<UdpSessionCallbackBox>.fromOpaque(context).takeUnretainedValue()
-        box.onClientReadDemand()
+        box.onClientReadDemand(probeId)
     }
 
 // ── Egress C callbacks ────────────────────────────────────────────────────────
@@ -466,17 +547,24 @@ private let ramaTcpOnEgressReadDemandCallback: @convention(c) (UnsafeMutableRawP
 private let ramaTcpOnPromoteRequestCallback:
     @convention(c) (UnsafeMutableRawPointer?) -> Void = { context in
         guard let context else { return }
-        let box = Unmanaged<TcpPromoteCallbackBox>.fromOpaque(context).takeUnretainedValue()
+        let box = retainTcpPromoteCallbackBox(from: context)
         box.onPromoteRequest()
     }
 
 // ── Owned-ingress release thunk ───────────────────────────────────────────────
 
-/// Releases the `NSData` retained on the zero-copy owned-ingress path
-/// (`RamaBytesOwnedView.owner`). Rust calls this exactly once — from an
-/// arbitrary thread — when it drops the `Bytes` it built from the
-/// transferred buffer, balancing the `Unmanaged.passRetained` taken in
-/// `RamaTcpSessionHandle.deliverOwned`.
+/// Releases the physical TCP root retained on the zero-copy owned-ingress path
+/// (`RamaBytesOwnedView.owner`). The root owns both stable `NSData` storage and
+/// its aggregate/transit charge. Rust calls this exactly once — from an
+/// arbitrary thread — when the last `Bytes` clone drops.
+private let ramaReleaseRetainedTcpBuffer: @convention(c) (UnsafeMutableRawPointer?) -> Void = {
+    context in
+    guard let context else { return }
+    Unmanaged<TcpRetainedBuffer>.fromOpaque(context).release()
+}
+
+/// Compatibility owner for callers which invoke the public `Data` API without
+/// a writer-budget root (primarily direct FFI tests).
 private let ramaReleaseRetainedNSData: @convention(c) (UnsafeMutableRawPointer?) -> Void = {
     context in
     guard let context else { return }
@@ -595,7 +683,8 @@ final class RamaTransparentProxyEngineHandle: @unchecked Sendable {
     }
 
     func config() -> RamaTransparentProxyConfigBridge? {
-        lifetime.withEngine(default: nil) { p in
+        lifetime.withEngine(default: Optional<RamaTransparentProxyConfigBridge>.none) {
+            p -> RamaTransparentProxyConfigBridge? in
             guard let outPtr = rama_transparent_proxy_get_config(p) else { return nil }
             defer { rama_transparent_proxy_config_free(outPtr) }
             let out = outPtr.pointee
@@ -640,6 +729,18 @@ final class RamaTransparentProxyEngineHandle: @unchecked Sendable {
                 flowPressureSoftCap: out.flow_pressure_soft_cap,
                 flowPressureLowWater: out.flow_pressure_low_water,
                 flowPressureIdleFloorMs: out.flow_pressure_idle_floor_ms,
+                liveFlowHardCap: out.live_flow_hard_cap,
+                udpIdleTimeoutMs: rama_transparent_proxy_engine_udp_idle_timeout_ms(p),
+                udpChannelCapacity: clampedFFISizeToInt(
+                    rama_transparent_proxy_engine_udp_channel_capacity(p)),
+                udpIngressPerFlowMaxBytes: clampedFFISizeToInt(
+                    rama_transparent_proxy_engine_udp_ingress_per_flow_max_bytes(p)),
+                udpIngressGlobalMaxBytes: clampedFFISizeToInt(
+                    rama_transparent_proxy_engine_udp_ingress_global_max_bytes(p)),
+                writerMemoryMaxBytes: clampedFFISizeToInt(
+                    rama_transparent_proxy_engine_writer_memory_max_bytes(p)),
+                writerMemoryMaxItems: clampedFFISizeToInt(
+                    rama_transparent_proxy_engine_writer_memory_max_items(p)),
                 tcpStartInFlightHardCap: out.tcp_start_in_flight_hard_cap,
                 tcpStartInFlightSoftCap: out.tcp_start_in_flight_soft_cap,
                 tcpStartLatencyBreakerP95Ms: out.tcp_start_latency_breaker_p95_ms,
@@ -697,7 +798,9 @@ final class RamaTransparentProxyEngineHandle: @unchecked Sendable {
         meta: RamaTransparentProxyFlowMetaBridge,
         onServerBytes: @escaping (Data) -> RamaTcpDeliverStatusBridge,
         onClientReadDemand: @escaping () -> Void,
-        onServerClosed: @escaping () -> Void
+        onServerClosed: @escaping () -> Void,
+        flowRefusalPolicy: FlowRefusalPolicy = FlowRefusalPolicy(
+            passthrough: defaultFlowRefusalPassthrough)
     ) -> RamaTransparentProxyTcpSessionDecision {
         lifetime.withEngine(default: .passthrough) { p in
             let callbackBox = Unmanaged.passRetained(
@@ -720,12 +823,15 @@ final class RamaTransparentProxyEngineHandle: @unchecked Sendable {
             else {
                 callbackBox.release()
                 return failOpenOnFlowRefusal(
-                    "ffi returned unknown tcp flow action \(result.action.rawValue)")
+                    "ffi returned unknown tcp flow action \(result.action.rawValue)",
+                    policy: flowRefusalPolicy)
                     ? .passthrough : .blocked
             }
             if action == .intercept, result.session == nil {
                 callbackBox.release()
-                return failOpenOnFlowRefusal("ffi returned tcp intercept without a session pointer")
+                return failOpenOnFlowRefusal(
+                    "ffi returned tcp intercept without a session pointer",
+                    policy: flowRefusalPolicy)
                     ? .passthrough : .blocked
             }
             guard action == .intercept, let sessionPtr = result.session else {
@@ -746,9 +852,11 @@ final class RamaTransparentProxyEngineHandle: @unchecked Sendable {
 
     func newUdpSession(
         meta: RamaTransparentProxyFlowMetaBridge,
-        onServerDatagram: @escaping (Data, RamaUdpPeer?) -> Void,
-        onClientReadDemand: @escaping () -> Void,
-        onServerClosed: @escaping () -> Void
+        onServerDatagram: @escaping (RamaBytesView, RamaUdpPeerView) -> Void,
+        onClientReadDemand: @escaping (UInt64) -> Void,
+        onServerClosed: @escaping () -> Void,
+        flowRefusalPolicy: FlowRefusalPolicy = FlowRefusalPolicy(
+            passthrough: defaultFlowRefusalPassthrough)
     ) -> RamaTransparentProxyUdpSessionDecision {
         lifetime.withEngine(default: .passthrough) { p in
             let callbackBox = Unmanaged.passRetained(
@@ -771,12 +879,15 @@ final class RamaTransparentProxyEngineHandle: @unchecked Sendable {
             else {
                 callbackBox.release()
                 return failOpenOnFlowRefusal(
-                    "ffi returned unknown udp flow action \(result.action.rawValue)")
+                    "ffi returned unknown udp flow action \(result.action.rawValue)",
+                    policy: flowRefusalPolicy)
                     ? .passthrough : .blocked
             }
             if action == .intercept, result.session == nil {
                 callbackBox.release()
-                return failOpenOnFlowRefusal("ffi returned udp intercept without a session pointer")
+                return failOpenOnFlowRefusal(
+                    "ffi returned udp intercept without a session pointer",
+                    policy: flowRefusalPolicy)
                     ? .passthrough : .blocked
             }
             guard action == .intercept, let sessionPtr = result.session else {
@@ -808,6 +919,12 @@ final class RamaTcpSessionHandle: @unchecked Sendable {
     /// `registerPromoteCallback` is called.
     private var promoteCallbackBox: Unmanaged<TcpPromoteCallbackBox>?
     private var cancelled = false
+#if DEBUG || RAMA_TESTING
+    /// Per-session test seams. Compiled out of release builds so production has
+    /// neither storage nor branches, and one test cannot park another session.
+    private var beforePromoteRegisterFFIForTest: (() -> Void)?
+    private var beforeSessionFreeFFIForTest: (() -> Void)?
+#endif
 
     fileprivate init(sessionPtr: OpaquePointer, callbackBox: Unmanaged<TcpSessionCallbackBox>) {
         self.sessionPtr = sessionPtr
@@ -823,6 +940,10 @@ final class RamaTcpSessionHandle: @unchecked Sendable {
         egressCallbackBox = nil
         let promoteBox = promoteCallbackBox
         promoteCallbackBox = nil
+#if DEBUG || RAMA_TESTING
+        let beforeFreeFFI = beforeSessionFreeFFIForTest
+        beforeSessionFreeFFIForTest = nil
+#endif
         lock.unlock()
 
         // Free the Rust session before releasing the boxes:
@@ -832,11 +953,14 @@ final class RamaTcpSessionHandle: @unchecked Sendable {
         // The engine guard is the load-bearing piece; this ordering
         // alone is necessary but insufficient.
         if let p {
+#if DEBUG || RAMA_TESTING
+            beforeFreeFFI?()
+#endif
             rama_transparent_proxy_tcp_session_free(p)
         }
         callbackBox.release()
         egressBox?.release()
-        promoteBox?.release()
+        retireTcpPromoteCallbackBox(promoteBox)
     }
 
     /// Deliver bytes from the intercepted flow to the Rust session.
@@ -847,7 +971,19 @@ final class RamaTcpSessionHandle: @unchecked Sendable {
     ///   * `.closed` — terminate the read pump; no demand will follow.
     @discardableResult
     func onClientBytes(_ data: Data) -> RamaTcpDeliverStatusBridge {
-        deliverOwned(data) { session, view in
+        deliverOwnedData(data) { session, view in
+            tcpDeliverStatus(
+                rama_transparent_proxy_tcp_session_on_client_bytes_owned(session, view)
+            )
+        }
+    }
+
+    /// Production read-pump entry point. The FFI owner is the retained
+    /// physical root, not a temporary slice `NSData`, so accepted Rust `Bytes`
+    /// keep the exact aggregate charge alive without changing the C ABI.
+    @discardableResult
+    func onClientPayload(_ payload: TcpPayloadSlice) -> RamaTcpDeliverStatusBridge {
+        deliverOwned(payload) { session, view in
             tcpDeliverStatus(
                 rama_transparent_proxy_tcp_session_on_client_bytes_owned(session, view)
             )
@@ -863,7 +999,7 @@ final class RamaTcpSessionHandle: @unchecked Sendable {
     /// `.paused` / `.closed` it leaves ownership with us, so we balance the
     /// retain here — the caller's `Data` value is untouched and can be
     /// replayed on `.paused`.
-    private func deliverOwned(
+    private func deliverOwnedData(
         _ data: Data,
         _ deliver: (OpaquePointer, RamaBytesOwnedView) -> RamaTcpDeliverStatusBridge
     ) -> RamaTcpDeliverStatusBridge {
@@ -887,6 +1023,31 @@ final class RamaTcpSessionHandle: @unchecked Sendable {
         let status = deliver(s, view)
         if status != .accepted {
             // Rust did not take ownership; drop the retain we passed.
+            owner.release()
+        }
+        return status
+    }
+
+    private func deliverOwned(
+        _ payload: TcpPayloadSlice,
+        _ deliver: (OpaquePointer, RamaBytesOwnedView) -> RamaTcpDeliverStatusBridge
+    ) -> RamaTcpDeliverStatusBridge {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !cancelled, let s = sessionPtr else { return .closed }
+
+        // Each accepted logical view transfers one +1 for the shared root.
+        // A cursor and any sibling Rust/write views may retain further +1s;
+        // the physical charge is released only after the final one disappears.
+        let owner = Unmanaged.passRetained(payload.root)
+        let view = RamaBytesOwnedView(
+            ptr: payload.bytes,
+            len: payload.count,
+            owner: owner.toOpaque(),
+            release: ramaReleaseRetainedTcpBuffer
+        )
+        let status = deliver(s, view)
+        if status != .accepted {
             owner.release()
         }
         return status
@@ -964,7 +1125,15 @@ final class RamaTcpSessionHandle: @unchecked Sendable {
     /// Same status contract as [`onClientBytes`] — see there.
     @discardableResult
     func onEgressBytes(_ data: Data) -> RamaTcpDeliverStatusBridge {
-        deliverOwned(data) { session, view in
+        deliverOwnedData(data) { session, view in
+            tcpDeliverStatus(
+                rama_transparent_proxy_tcp_session_on_egress_bytes_owned(session, view)
+            )
+        }
+    }
+    @discardableResult
+    func onEgressPayload(_ payload: TcpPayloadSlice) -> RamaTcpDeliverStatusBridge {
+        deliverOwned(payload) { session, view in
             tcpDeliverStatus(
                 rama_transparent_proxy_tcp_session_on_egress_bytes_owned(session, view)
             )
@@ -1030,21 +1199,23 @@ final class RamaTcpSessionHandle: @unchecked Sendable {
     /// `into_passthrough` resolves with `EgressUnavailable` and
     /// the layer falls through to the in-Rust data path.
     ///
-    /// CONTRACT: `onPromoteRequest` MUST NOT synchronously call
-    /// `cancel()` on this same session. Rust's `fire()` holds the
-    /// session's `callback_active` lock across the C-trampoline
-    /// call to keep this box alive — a re-entrant `cancel()` would
-    /// deadlock waiting for that same lock. Hop to a dispatch
-    /// queue inside `onPromoteRequest` and return immediately, as
-    /// the production callsite in `TransparentProxyCore` does.
-    /// `confirmPromoted(_:reason:)` is safe to call synchronously.
+    /// CONTRACT: `onPromoteRequest` MUST NOT synchronously call any
+    /// method on this same session, including `cancel()`, another
+    /// `registerPromoteCallback`, or `confirmPromoted`. Rust's
+    /// `fire()` holds the session's `callback_active` lock across
+    /// the C trampoline to keep this box alive, while session
+    /// methods enter through this handle's lock. Concurrent or
+    /// re-entrant entry can therefore invert those two locks and
+    /// deadlock. Hop to a dispatch queue inside `onPromoteRequest`
+    /// and return immediately, as the production callsite does.
     func registerPromoteCallback(_ onPromoteRequest: @escaping () -> Void) {
         lock.lock()
-        defer { lock.unlock() }
-        guard !cancelled, let s = sessionPtr else { return }
+        guard !cancelled, let s = sessionPtr else {
+            lock.unlock()
+            return
+        }
 
-        let box = Unmanaged.passRetained(
-            TcpPromoteCallbackBox(onPromoteRequest: onPromoteRequest))
+        let box = makeTcpPromoteCallbackBox(onPromoteRequest: onPromoteRequest)
         let previous = promoteCallbackBox
         promoteCallbackBox = box
 
@@ -1052,12 +1223,32 @@ final class RamaTcpSessionHandle: @unchecked Sendable {
             context: box.toOpaque(),
             on_promote_request: ramaTcpOnPromoteRequestCallback
         )
+#if DEBUG || RAMA_TESTING
+        beforePromoteRegisterFFIForTest?()
+#endif
         rama_transparent_proxy_tcp_session_register_promote_callbacks(s, callbacks)
+        lock.unlock()
 
-        // Drop the previous box only after the new registration
-        // is in place so Rust never sees a stale pointer.
-        previous?.release()
+        // Rust has replaced the raw pointer under `callback_active`, so the old
+        // owner can now retire safely. Do this outside both locks: releasing a
+        // closure can run arbitrary captured-value deinits, including code that
+        // re-enters this session.
+        retireTcpPromoteCallbackBox(previous)
     }
+
+#if DEBUG || RAMA_TESTING
+    func setBeforePromoteRegisterFFIForTest(_ hook: (() -> Void)?) {
+        lock.lock()
+        beforePromoteRegisterFFIForTest = hook
+        lock.unlock()
+    }
+
+    func setBeforeSessionFreeFFIForTest(_ hook: (() -> Void)?) {
+        lock.lock()
+        beforeSessionFreeFFIForTest = hook
+        lock.unlock()
+    }
+#endif
 
     /// ACK an in-flight `PromoteHandle::into_passthrough` cutover.
     ///
@@ -1105,6 +1296,9 @@ final class RamaUdpSessionHandle: @unchecked Sendable {
     private var sessionPtr: OpaquePointer?
     private let callbackBox: Unmanaged<UdpSessionCallbackBox>
     private var cancelled = false
+    #if DEBUG || RAMA_TESTING
+        private var testAfterCancelledBeforeRustClose: (@Sendable () -> Void)?
+    #endif
 
     fileprivate init(sessionPtr: OpaquePointer, callbackBox: Unmanaged<UdpSessionCallbackBox>) {
         self.sessionPtr = sessionPtr
@@ -1160,11 +1354,48 @@ final class RamaUdpSessionHandle: @unchecked Sendable {
         rama_transparent_proxy_udp_session_activate(s)
     }
 
-    func onClientClose() {
+    /// Mark the exact leased Apple read complete. Its admission credit remains
+    /// charged until the owning datagram is consumed, the flow closes, or the
+    /// bounded delivery grace expires. Zero/stale IDs are harmless no-ops.
+    func completeClientRead(probeId: UInt64) {
         lock.lock()
         defer { lock.unlock() }
         guard !cancelled, let s = sessionPtr else { return }
+        rama_transparent_proxy_udp_session_on_client_read_complete(s, probeId)
+    }
+
+    #if DEBUG || RAMA_TESTING
+        func testSetAfterCancelledBeforeRustClose(_ hook: (@Sendable () -> Void)?) {
+            lock.lock()
+            testAfterCancelledBeforeRustClose = hook
+            lock.unlock()
+        }
+    #endif
+
+    func onClientClose() {
+        lock.lock()
+        guard !cancelled, let s = sessionPtr else {
+            lock.unlock()
+            return
+        }
         cancelled = true
-        rama_transparent_proxy_udp_session_on_client_close(s)
+        #if DEBUG || RAMA_TESTING
+            let afterCancelled = testAfterCancelledBeforeRustClose
+        #endif
+        lock.unlock()
+
+        #if DEBUG || RAMA_TESTING
+            afterCancelled?()
+        #endif
+
+        // Rust close waits for any in-flight demand callback to leave its
+        // demand gate. Do not hold this handle lock across that wait: a demand
+        // callback may concurrently finish by attempting an ACK through the
+        // same handle. The cancelled publication prevents any new FFI entry,
+        // while this explicit lifetime keeps the callback box/session storage
+        // alive until Rust has drained the callback and returned.
+        withExtendedLifetime(self) {
+            rama_transparent_proxy_udp_session_on_client_close(s)
+        }
     }
 }

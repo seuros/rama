@@ -1,5 +1,6 @@
 import Foundation
 import Network
+import NetworkExtension
 
 /// Per-flow data-path mode. Switches from `.viaRust` to
 /// `.promoted` when the in-Rust service calls
@@ -36,11 +37,41 @@ struct TcpFlowMaintenanceState {
     var lastActivityAt: DispatchTime = .now()
     var lingerCloseMs: UInt32 = defaultLingerCloseMs
     var mode: TcpFlowMode = .viaRust
+    /// Set in the same lock scope that commits a pressure reservation. Data
+    /// producers use it to avoid reporting accepted bytes after teardown won.
+    var pressureEvictionCommitted = false
+    /// Created only for promoted retirement or detach, not on the normal
+    /// data/admission path. Sharing this stable handle lets those two terminal
+    /// paths claim one physical NWConnection without relying on reusable object
+    /// addresses.
+    var resourceRetirementIdentity: ResourceRetirementIdentity?
 }
 
 /// Mutable flow state is confined to its dedicated serial queue. Fields read
 /// by maintenance scans are mirrored through one locked snapshot.
 final class TcpFlowContext: @unchecked Sendable {
+    enum DiagnosticEvent: UInt8 {
+        case kernelOpen, clientEof, rustServerClosed, kernelWriteClose, egressFin
+
+        var name: String {
+            switch self {
+            case .kernelOpen: return "kernel_open_result"
+            case .clientEof: return "client_read_eof"
+            case .rustServerClosed: return "rust_server_closed"
+            case .kernelWriteClose: return "kernel_write_close"
+            case .egressFin: return "egress_fin_result"
+            }
+        }
+    }
+
+    // Correlate bounded terminal diagnostics without exposing object addresses,
+    // application identity, or endpoints. Provider process identity scopes IDs.
+    private static let nextDiagnosticId = Locked<UInt64>(0)
+    let diagnosticId = TcpFlowContext.nextDiagnosticId.withLock { value in
+        value &+= 1
+        return value
+    }
+    private var reportedDiagnosticEvents: UInt8 = 0
     private let maintenanceState = Locked(TcpFlowMaintenanceState())
     // Connection is held behind the injectable protocol so unit tests
     // can drive the per-flow state machine via a mock instead of
@@ -97,18 +128,19 @@ final class TcpFlowContext: @unchecked Sendable {
     /// flow — coalesces a burst of triggers into one outstanding verdict.
     /// Set / cleared on `flowQueue`, like `lastPathViable`.
     var deadPathRecheckPending = false
-    /// A terminal close signal (server EOF / egress close, `viaRust`
-    /// mode) was observed on `flowQueue` and the graceful drain +
-    /// teardown was kicked off. Set on `flowQueue`; read off-queue by the
-    /// periodic maintenance watchdog through the locked snapshot. The
-    /// watchdog combines this with `drainClosePending`.
+    /// A terminal close signal (server EOF / egress close, `viaRust` mode) was
+    /// observed. The egress read pump publishes it at the transport boundary
+    /// before entering Rust so promotion cannot overtake the one-shot close
+    /// callback; ordinary close handlers and the promoted forwarder also set
+    /// it on `flowQueue`. Read off-queue by the maintenance watchdog through
+    /// the locked snapshot, together with `drainClosePending`.
     var terminalSignalled: Bool {
         get { maintenanceState.withLock { $0.terminalSignalled } }
         set { maintenanceState.withLock { $0.terminalSignalled = newValue } }
     }
     /// A promoted or Rust-backed write drain is still outstanding. Unlike
-    /// `terminalSignalled`, this clears after one half finishes draining and
-    /// is read from the maintenance queue.
+    /// `terminalSignalled`, this clears only after every concurrently pending
+    /// writer drain finishes and is read from the maintenance queue.
     var drainClosePending: Bool {
         get { maintenanceState.withLock { $0.drainClosePending } }
         set { maintenanceState.withLock { $0.drainClosePending = newValue } }
@@ -143,9 +175,9 @@ final class TcpFlowContext: @unchecked Sendable {
     var directForwarder: TcpDirectForwarder?
     /// Monotonic timestamp (`DispatchTime`, mach-uptime — pauses during
     /// system sleep, like the engine's tokio idle timers) of the last byte
-    /// observed on the promoted (`TcpDirectForwarder`) data path. Bumped by
-    /// the forwarder's `onActivity` hook on `flowQueue`; read off-queue
-    /// through the maintenance snapshot. A promoted flow idle past
+    /// observed on either data path. The via-Rust read/write pumps and the
+    /// promoted forwarder bump it on `flowQueue`; maintenance reads it
+    /// through the locked snapshot. A promoted flow idle past
     /// `defaultPromotedIdleTimeoutMs` is reaped by `applyIdleTimeout`.
     ///
     /// Restores the idle backstop a flow already had on the `viaRust` path
@@ -161,8 +193,52 @@ final class TcpFlowContext: @unchecked Sendable {
         set { maintenanceState.withLock { $0.lastActivityAt = newValue } }
     }
 
+    /// Linearize a producer's accepted-byte activity against the pressure
+    /// reaper's final commit. `false` means teardown already won and the
+    /// producer must report the destination closed instead of accepting data.
+    func recordActivityUnlessPressureEvicted() -> Bool {
+        maintenanceState.withLock { state in
+            guard !state.pressureEvictionCommitted else { return false }
+            state.lastActivityAt = .now()
+            return true
+        }
+    }
+
     func maintenanceSnapshot() -> TcpFlowMaintenanceState {
         maintenanceState.withLock { $0 }
+    }
+
+    func retirementIdentity() -> ResourceRetirementIdentity {
+        maintenanceState.withLock { state in
+            if let identity = state.resourceRetirementIdentity {
+                return identity
+            }
+            let identity = ResourceRetirementIdentity()
+            state.resourceRetirementIdentity = identity
+            return identity
+        }
+    }
+
+    /// Saturating idle age at one lock-defined instant. Activity may publish
+    /// after the caller captures `nowNs`; that is age zero, not unsigned wrap.
+    func idleMs(
+        nowNs: UInt64 = DispatchTime.now().uptimeNanoseconds
+    ) -> UInt64 {
+        maintenanceState.withLock { state in
+            let lastNs = state.lastActivityAt.uptimeNanoseconds
+            guard lastNs <= nowNs else { return 0 }
+            return (nowNs - lastNs) / 1_000_000
+        }
+    }
+
+    /// Run a final pressure-eviction decision while activity publication is
+    /// excluded. The caller may atomically claim its external reservation in
+    /// this closure: activity that wins this lock is observed and spares the
+    /// flow; activity after the claim loses to an already-committed teardown.
+    func withMaintenanceStateLocked<T>(
+        _ body: (inout TcpFlowMaintenanceState) -> T
+    ) -> T {
+        maintenanceState.withLock { body(&$0) }
     }
     /// The per-flow serial queue that confines every mutation of this
     /// context (and the `isDone` teardown flag). Set once by
@@ -188,14 +264,75 @@ final class TcpFlowContext: @unchecked Sendable {
     /// pre-open cleanup path fires. Lets the core maintain an exact in-flight
     /// start gauge and start-to-ready latency window.
     var admissionToken: TcpAdmissionToken?
+    /// Engine lifecycle that created this flow. Removal callbacks carry it
+    /// back to the core so stale teardown work from a detached engine cannot
+    /// alter a newly attached engine's pressure episode.
+    var engineGeneration: UInt64?
     /// Sticky one-shot teardown guard. Mutated and read only on
     /// `flowQueue` (single-threaded by construction), so it needs no lock.
     private(set) var isDone = false
+    /// Each `NEAppProxyTCPFlow` half has one terminal close operation. Keep
+    /// those edges separate from whole-flow teardown so a later aggregate
+    /// terminal cannot repeat a close or replace its original error.
+    private var clientReadClosed = false
+    private var clientWriteClosed = false
 
     init() {
     }
 
-    // ── Teardown (folded in from the former `TcpFlowTeardown`) ──────────
+    /// Called only on the flow queue, like the close transitions it describes.
+    /// Each event appears at most once, including a duplicate terminal callback.
+    func logDiagnostic(_ event: DiagnosticEvent, error: Error? = nil) {
+        if let record = diagnosticRecord(for: event, error: error) {
+            RamaLog.debugPublic(record)
+        }
+    }
+
+    func diagnosticRecord(for event: DiagnosticEvent, error: Error? = nil) -> String? {
+        let mask: UInt8 = 1 << event.rawValue
+        guard reportedDiagnosticEvents & mask == 0 else { return nil }
+        reportedDiagnosticEvents |= mask
+        let errorKind: String
+        let errorCode: Int
+        if let networkError = error as? NWError {
+            switch networkError {
+            case .posix(let code): (errorKind, errorCode) = ("posix", Int(code.rawValue))
+            case .dns(let code): (errorKind, errorCode) = ("dns", Int(code))
+            case .tls(let code): (errorKind, errorCode) = ("tls", Int(code))
+            default: (errorKind, errorCode) = ("network", (networkError as NSError).code)
+            }
+        } else if let error {
+            let value = error as NSError
+            switch value.domain {
+            case NSPOSIXErrorDomain: errorKind = "posix"
+            case NSURLErrorDomain: errorKind = "url"
+            case NEAppProxyErrorDomain: errorKind = "app_proxy"
+            default: errorKind = "other"
+            }
+            errorCode = value.code
+        } else {
+            (errorKind, errorCode) = ("none", 0)
+        }
+        return "tcp_terminal diagnostic_id=\(diagnosticId) engine_generation=\(engineGeneration ?? 0) "
+            + "event=\(event.name) mode=\(mode == .viaRust ? "via_rust" : "promoted") "
+            + "egress_ready=\(egressReady ? 1 : 0) done=\(isDone ? 1 : 0) "
+            + "error_kind=\(errorKind) error_code=\(errorCode)"
+    }
+
+    func closeClientReadOnce(_ error: Error?) {
+        guard !clientReadClosed else { return }
+        clientReadClosed = true
+        flow?.closeReadWithError(error)
+    }
+
+    func closeClientWriteOnce(_ error: Error?) {
+        guard !clientWriteClosed else { return }
+        clientWriteClosed = true
+        logDiagnostic(.kernelWriteClose, error: error)
+        flow?.closeWriteWithError(error)
+    }
+
+    // MARK: - Teardown
     //
     // Several terminal-state transitions race each other (egress
     // `.failed`/`.waiting`/`.cancelled`, connect timeout, writer/read pump
@@ -238,30 +375,28 @@ final class TcpFlowContext: @unchecked Sendable {
             admissionToken = nil
         }
         let err = tcpUpstreamUnavailableError()
-        flow?.closeReadWithError(err)
-        flow?.closeWriteWithError(err)
+        closeClientReadOnce(err)
+        closeClientWriteOnce(err)
         connection?.cancelAndDetach()
         connection = nil
         session?.cancel()
-        if let flowId { core?.removeTcpFlow(flowId) }
+        if let flowId {
+            core?.removeTcpFlow(
+                flowId,
+                context: self,
+                engineGeneration: engineGeneration)
+        }
     }
 
     // MARK: Post-open writer-self-terminal
 
-    /// `TcpClientWritePump.onTerminalError` fired: the writer exhausted its
-    /// retry budget or hit a non-transient error. Closes the kernel flow,
-    /// cancels the egress NWConnection + session. Other pumps are NOT
-    /// explicitly cancelled — the NWConnection cancel surfaces in their read
-    /// loops as the canonical unwind signal.
+    /// Either write pump exhausted its retry budget or hit a non-transient
+    /// error. Cancel both writers before closing either transport: a Rust
+    /// callback already inside `callback_active` may concurrently enqueue to
+    /// the sibling writer, and it must observe `.closed` rather than schedule a
+    /// kernel write after the transport has been closed.
     func applyWriterTerminal(_ error: Error) {
-        guard !isDone else { return }
-        isDone = true
-        flow?.closeReadWithError(error)
-        flow?.closeWriteWithError(error)
-        connection?.cancelAndDetach()
-        connection = nil
-        session?.cancel()
-        if let flowId { core?.removeTcpFlow(flowId) }
+        applyFullTeardown(error: error, driveForwarder: true)
     }
 
     // MARK: Post-open natural close
@@ -275,39 +410,87 @@ final class TcpFlowContext: @unchecked Sendable {
         guard !isDone else { return }
         isDone = true
         if let error {
-            flow?.closeReadWithError(error)
-            flow?.closeWriteWithError(error)
+            closeClientReadOnce(error)
+            closeClientWriteOnce(error)
         } else if wasOpened {
-            flow?.closeReadWithError(nil)
-            flow?.closeWriteWithError(nil)
+            closeClientReadOnce(nil)
+            closeClientWriteOnce(nil)
         } else {
             let error = tcpUpstreamUnavailableError()
-            flow?.closeReadWithError(error)
-            flow?.closeWriteWithError(error)
+            closeClientReadOnce(error)
+            closeClientWriteOnce(error)
         }
         connection?.cancelAndDetach()
         connection = nil
-        if let flowId { core?.removeTcpFlow(flowId) }
+        if let flowId {
+            core?.removeTcpFlow(
+                flowId,
+                context: self,
+                engineGeneration: engineGeneration)
+        }
     }
 
-    /// The promoted forwarder reached its natural terminal (both directions
-    /// finished). Unlike `applyDrainedClose`, in `.promoted` mode the egress
-    /// NWConnection's FIN/linger is owned by the egress write pump, so we
-    /// MUST NOT cancel the connection here — that would abort the FIN. We
-    /// mark `isDone` (so a racing wake-recheck / watchdog no-ops), detach the
-    /// connection's handlers, drop the registry entry, and close the kernel
-    /// flow clean. We deliberately do NOT nil `directForwarder` (its
-    /// callbacks capture `[weak ctx]`, so it drops when the ctx leaves the
-    /// registry; niling here would race observers reading its phase).
+    /// Clean server→client half-close. Keep accepting client→server bytes
+    /// until Rust independently closes and drains the egress writer.
+    func applyClientWriteHalfClose() {
+        guard !isDone else { return }
+        closeClientWriteOnce(nil)
+    }
+
+    /// Both Rust write directions have drained. The client write half was
+    /// already closed when its drain completed, so close only the remaining
+    /// read half before releasing the connection and registry ownership.
+    func applyFullyDrainedClose() {
+        guard !isDone else { return }
+        isDone = true
+        closeClientReadOnce(nil)
+        connection?.cancelAndDetach()
+        connection = nil
+        if let flowId {
+            core?.removeTcpFlow(
+                flowId,
+                context: self,
+                engineGeneration: engineGeneration)
+        }
+    }
+
+    /// Publish terminal accounting; the forwarder then releases the drained
+    /// connection through the write pump on this same flow queue.
     func applyPromotedTerminal() {
         guard !isDone else { return }
         isDone = true
-        flow?.closeReadWithError(nil)
-        flow?.closeWriteWithError(nil)
+        // Move this flow from reclaimable registry occupancy into the hard-cap
+        // retirement ledger before its async registry removal can expose a
+        // replacement slot. The write pump releases the token only at the
+        // connection's actual `cancelAndDetach` point.
+        if let core, let egressWritePump {
+            let identity = retirementIdentity()
+            let release: @Sendable () -> Void
+            if let flowId {
+                release = core.transferRegisteredResourceToRetirement(
+                    flowId: flowId,
+                    contextId: ObjectIdentifier(self),
+                    engineGeneration: engineGeneration,
+                    identity: identity)
+            } else {
+                // Defensive engine-less fallback: without a registry key there
+                // is no ownership overlap to transfer, but the live connection
+                // must still consume retirement capacity until cancellation.
+                release = core.beginResourceRetirement()
+            }
+            egressWritePump.installTerminalResourceRelease(release)
+        }
+        closeClientReadOnce(nil)
+        closeClientWriteOnce(nil)
         connection?.stateUpdateHandler = nil
         connection?.viabilityUpdateHandler = nil
         connection = nil
-        if let flowId { core?.removeTcpFlow(flowId) }
+        if let flowId {
+            core?.removeTcpFlow(
+                flowId,
+                context: self,
+                engineGeneration: engineGeneration)
+        }
     }
 
     // MARK: Post-open full teardown
@@ -439,21 +622,30 @@ final class TcpFlowContext: @unchecked Sendable {
             admissionToken = nil
         }
         clientWritePump?.cancel()
-        flow?.closeReadWithError(error)
-        flow?.closeWriteWithError(error)
+        closeClientReadOnce(error)
+        closeClientWriteOnce(error)
         connection?.cancelAndDetach()
         connection = nil
         egressReadPump?.cancel()
         egressReadPump = nil
         egressWritePump?.cancel()
-        egressWritePump = nil
         clientReadPump = nil
-        clientWritePump = nil
         if driveForwarder {
             directForwarder?.cancel()
             directForwarder = nil
         }
+        // `cancel()` waits for Rust callbacks already inside callback_active.
+        // Keep both callback-visible writer slots intact until that barrier
+        // returns; the callbacks see synchronously canceled pumps and report
+        // `.closed`, never a racing ARC load versus a nil store.
         session?.cancel()
-        if let flowId { core?.removeTcpFlow(flowId) }
+        egressWritePump = nil
+        clientWritePump = nil
+        if let flowId {
+            core?.removeTcpFlow(
+                flowId,
+                context: self,
+                engineGeneration: engineGeneration)
+        }
     }
 }
