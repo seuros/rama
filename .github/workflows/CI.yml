@@ -994,7 +994,8 @@ jobs:
       - uses: superfly/flyctl-actions/setup-flyctl@fc53c09e1bc3be6f54706524e3b82c4f462f77be # 1.5
       - run: |
           cd rama-fp/infra/deployments/fp
-          flyctl deploy --verbose --remote-only --max-concurrent 1
+          flyctl scale count app_secure=1 app_insecure=1 --yes
+          flyctl deploy --verbose --remote-only --ha=false
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
 
@@ -1006,7 +1007,8 @@ jobs:
       - uses: superfly/flyctl-actions/setup-flyctl@fc53c09e1bc3be6f54706524e3b82c4f462f77be # 1.5
       - run: |
           cd rama-fp/infra/deployments/fp-h1
-          flyctl deploy --verbose --remote-only --max-concurrent 1
+          flyctl scale count app_secure=1 app_insecure=1 --yes
+          flyctl deploy --verbose --remote-only --ha=false
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
 
@@ -1018,7 +1020,8 @@ jobs:
       - uses: superfly/flyctl-actions/setup-flyctl@fc53c09e1bc3be6f54706524e3b82c4f462f77be # 1.5
       - run: |
           cd rama-fp/infra/deployments/ipv4
-          flyctl deploy --verbose --remote-only --max-concurrent 1
+          flyctl scale count app_secure=1 app_insecure=1 --yes
+          flyctl deploy --verbose --remote-only --ha=false
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
 
@@ -1030,7 +1033,8 @@ jobs:
       - uses: superfly/flyctl-actions/setup-flyctl@fc53c09e1bc3be6f54706524e3b82c4f462f77be # 1.5
       - run: |
           cd rama-fp/infra/deployments/ipv6
-          flyctl deploy --verbose --remote-only --max-concurrent 1
+          flyctl scale count app_secure=1 app_insecure=1 --yes
+          flyctl deploy --verbose --remote-only --ha=false
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
 
@@ -1042,7 +1046,8 @@ jobs:
       - uses: superfly/flyctl-actions/setup-flyctl@fc53c09e1bc3be6f54706524e3b82c4f462f77be # 1.5
       - run: |
           cd rama-fp/infra/deployments/echo
-          flyctl deploy --verbose --remote-only --max-concurrent 1
+          flyctl scale count app_secure=1 app_insecure=1 --yes
+          flyctl deploy --verbose --remote-only --ha=false
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
 
@@ -1054,6 +1059,7 @@ jobs:
       - uses: superfly/flyctl-actions/setup-flyctl@fc53c09e1bc3be6f54706524e3b82c4f462f77be # 1.5
       - run: |
           cd rama-fp/infra/deployments/http-test
-          flyctl deploy --verbose --remote-only --max-concurrent 1
+          flyctl scale count app_secure=1 app_insecure=1 --yes
+          flyctl deploy --verbose --remote-only --ha=false
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}

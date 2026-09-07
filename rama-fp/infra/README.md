@@ -2,6 +2,28 @@
 
 Fly.io deployment configs for the public rama demo services and supporting scripts.
 
+## Public demo capacity
+
+These free community services run **one Machine per process group** in `fra`:
+one `app_secure` Machine for HTTPS and one `app_insecure` Machine for HTTP.
+All six apps currently need that split, for 12 Machines total. The five GeoIP
+apps each use two `geoip` volumes; `rama-http-test` uses none, for 10 volumes total.
+Each Machine uses one shared CPU and 256 MB of RAM.
+
+CI and the GeoIP rollout reconcile the count with
+`fly scale count app_secure=1 app_insecure=1 --yes`, then deploy with `--ha=false`
+to prevent automatic spare creation. `min_machines_running = 1` keeps the sole
+Machine in each process group running; it does not set a maximum replica count.
+This small footprint accepts brief interruptions during deployments or host
+failures instead of provisioning redundant replicas.
+
+Stopped Machines still count as replicas and are included in deployments.
+Stopping does not delete them, and destroying a Machine does not delete its
+volume. After scaling down or replacing a Machine, verify the retained GeoIP
+copies and explicitly delete the unused volumes. Do not keep rollback volumes
+indefinitely: unattached volumes still incur storage charges. Volumes already
+in `pending_destroy` are soft deleted and no longer accrue volume charges.
+
 ## Deployment host capacity failures
 
 `could not reserve resource for machine: insufficient memory available to fulfill
@@ -11,10 +33,10 @@ the host's lack of capacity. A stopped Machine with a GeoIP volume is tied to
 that volume's host; repeated deployments can keep failing on the same Machine
 even while other replicas deploy successfully.
 
-CI and the GeoIP rollout update one Machine per app at a time (`--max-concurrent
-1`). This limits overlapping updates and the resulting `machine is replacing:
-concurrent update in progress` errors when a deployment retries. It does not
-resolve a persistent host capacity shortage.
+Keeping one running Machine per process group avoids deploying to unused,
+auto-stopped replicas. It does not guarantee host capacity after a Machine
+stops. Fly CLI 0.4.99 does not apply `--max-concurrent` to rolling deployments,
+so that flag cannot serialize our updates.
 
 To recover a replica that remains blocked, use Fly's
 [volume fork procedure](https://fly.io/docs/volumes/volume-manage/#create-a-copy-of-a-volume-fork-a-volume)
@@ -35,7 +57,9 @@ Machine:
    and confirm it can start and serve requests. Only then remove the old,
    stopped Machine with `fly machine destroy MACHINE -a APP`. Its original
    volume remains available for rollback; retained volumes still incur storage
-   charges, so remove them separately once recovery is confirmed.
+   charges, so remove them separately once recovery is confirmed. Restore the
+   one-Machine-per-process-group count before the next CI or GeoIP rollout;
+   those workflows enforce that count.
 5. Rerun the failed CI jobs and run `bash scripts/remote-healthcheck.sh` from
    this directory. Check both HTTP and HTTPS; they run in separate process
    groups.
