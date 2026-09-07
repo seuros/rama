@@ -223,7 +223,7 @@ deploy_app() {
   local app="$1" cfg="$DEPLOY_DIR/${1#rama-}/fly.toml"
   [ -f "$cfg" ] || { warn "[$app] no fly.toml at $cfg"; return 1; }
   log "[$app] deploying"
-  retry fly deploy -c "$cfg" -a "$app" --yes \
+  retry fly deploy -c "$cfg" -a "$app" --max-concurrent 1 --yes \
     || { warn "[$app] deploy failed after $RETRY_MAX attempts"; return 1; }
 }
 
