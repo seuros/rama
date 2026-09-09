@@ -26,7 +26,12 @@ targets = [
 
 [features]
 default = []
-inspect = ["dep:parking_lot", "dep:rama-inspect", "rama-http/inspect", "rama-tls?/inspect"]
+inspect = [
+    "dep:parking_lot",
+    "dep:rama-inspect",
+    "rama-http/inspect",
+    "rama-tls?/inspect",
+]
 embed-profiles = []
 tls = ["dep:rama-tls", "rama-tls/http"]
 
