@@ -4000,6 +4000,7 @@ dependencies = [
  "rama-http-backend",
  "rama-http-core",
  "rama-icap",
+ "rama-inspect",
  "rama-js",
  "rama-json",
  "rama-net",
@@ -4135,8 +4136,10 @@ dependencies = [
  "aws-lc-rs",
  "base64 0.23.1",
  "openssl-probe",
+ "parking_lot",
  "rama-boring",
  "rama-core",
+ "rama-inspect",
  "rama-net",
  "rama-utils",
  "rcgen",
@@ -4147,6 +4150,7 @@ dependencies = [
  "serde_json",
  "sha2 0.11.0",
  "time",
+ "tokio",
  "tokio-test",
  "webpki-root-certs",
  "x509-parser",
@@ -4323,6 +4327,7 @@ name = "rama-http"
 version = "0.5.0"
 dependencies = [
  "ahash",
+ "arc-swap",
  "async-compression",
  "base64 0.23.1",
  "bitflags 2.13.1",
@@ -4351,6 +4356,7 @@ dependencies = [
  "rama-http-hyperium",
  "rama-http-macros",
  "rama-http-types",
+ "rama-inspect",
  "rama-json",
  "rama-net",
  "rama-utils",
@@ -4516,6 +4522,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rama-inspect"
+version = "0.5.0"
+dependencies = [
+ "parking_lot",
+ "rama-core",
+ "rama-utils",
+ "serde",
+ "tokio",
+]
+
+[[package]]
 name = "rama-js"
 version = "0.5.0"
 dependencies = [
@@ -4574,6 +4591,7 @@ dependencies = [
  "ipnet",
  "itertools 0.15.0",
  "itoa",
+ "jiff",
  "jni",
  "libc",
  "memchr",
@@ -4589,6 +4607,7 @@ dependencies = [
  "quickcheck_macros",
  "radix_trie 0.3.0",
  "rama-core",
+ "rama-inspect",
  "rama-macros",
  "rama-utils",
  "serde",
@@ -4724,6 +4743,7 @@ dependencies = [
  "pin-project-lite",
  "rama-core",
  "rama-crypto",
+ "rama-inspect",
  "rama-net",
  "rama-utils",
  "serde",
@@ -4845,8 +4865,10 @@ version = "0.5.0"
 dependencies = [
  "ahash",
  "itertools 0.15.0",
+ "parking_lot",
  "rama-core",
  "rama-http",
+ "rama-inspect",
  "rama-net",
  "rama-tls",
  "rama-utils",
@@ -4888,6 +4910,7 @@ name = "rama-utils"
 version = "0.5.0"
 dependencies = [
  "ahash",
+ "base64 0.23.1",
  "const_format",
  "loom",
  "memchr",
@@ -4911,14 +4934,18 @@ dependencies = [
 name = "rama-ws"
 version = "0.5.0"
 dependencies = [
+ "base64 0.23.1",
  "flate2",
+ "jiff",
  "parking_lot",
  "pin-project-lite",
  "rama-core",
  "rama-http",
+ "rama-inspect",
  "rama-net",
  "rama-utils",
  "rand 0.10.2",
+ "serde",
  "serde_json",
  "tokio",
  "tracing-test",
