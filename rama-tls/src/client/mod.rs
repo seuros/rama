@@ -23,6 +23,8 @@ mod config;
 #[cfg(feature = "http")]
 mod http;
 mod pool;
+#[cfg(feature = "test-utils")]
+pub mod test_utils;
 #[doc(inline)]
 pub use config::{
     ClientAuth, ClientAuthData, ServerTrustRoots, ServerVerifyMode, TlsClientAuth, TlsClientConfig,

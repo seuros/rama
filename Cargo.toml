@@ -422,6 +422,7 @@ std = [
 test-utils = [
     "rama-inspect?/test-utils",
     "rama-net?/test-utils",
+    "rama-tls?/test-utils",
     "rama-udp?/test-utils",
     "rama-quic?/test-utils",
 ]

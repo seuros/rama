@@ -28,6 +28,8 @@ targets = [
 default = []
 inspect = ["dep:rama-inspect"]
 http = []
+# Connector checks shared by the TLS backend crates.
+test-utils = ["tokio/rt", "tokio/time"]
 dial9 = ["dep:dial9-trace-format", "rama-core/dial9"]
 
 [dependencies]

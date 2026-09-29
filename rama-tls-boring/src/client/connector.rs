@@ -907,21 +907,16 @@ pub struct ConnectorKindTunnel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rama_net::client::pool::ConnectionReuse;
+    use rama_core::ServiceInput;
     #[cfg(feature = "http")]
     use rama_net::tls::TlsAlpn;
-
-    use rama_core::{ServiceInput, service::service_fn};
-    use rama_net::{
-        address::HostWithPort,
-        client::{ConnectRequest, ConnectionErrorDomain},
-    };
+    use rama_net::{address::HostWithPort, client::ConnectRequest};
+    use rama_tls::client::test_utils::{self, ServerAuth, Transport};
     use rama_tls::client::{ServerVerifyMode, TlsServerName, TlsServerVerify};
 
     use rama_crypto::cert::generate_server_auth;
     use rama_net::stream::service::EchoService;
-    use rama_tls::server::{GeneratedServerAuthConfig, ServerAuthData, TlsServerConfig};
-    use std::{sync::Arc, time::Duration};
+    use rama_tls::server::{GeneratedServerAuthConfig, TlsServerConfig};
 
     fn origin_attempt() -> ConnectRequest {
         let input =
@@ -933,75 +928,70 @@ mod tests {
         input
     }
 
+    fn auto(transport: Transport, base: Option<TlsClientConfig>) -> TlsConnector<Transport> {
+        TlsConnector::auto(transport).maybe_with_base_config(base)
+    }
+
+    fn secure(
+        transport: Transport,
+        base: Option<TlsClientConfig>,
+    ) -> TlsConnector<Transport, ConnectorKindSecure> {
+        TlsConnector::secure(transport).maybe_with_base_config(base)
+    }
+
+    fn tunnel(
+        transport: Transport,
+        base: Option<TlsClientConfig>,
+    ) -> TlsConnector<Transport, ConnectorKindTunnel> {
+        TlsConnector::tunnel(transport, None).maybe_with_base_config(base)
+    }
+
+    fn server_auth() -> ServerAuth {
+        generate_server_auth(GeneratedServerAuthConfig::default()).expect("server auth")
+    }
+
+    fn acceptor(config: TlsServerConfig) -> impl Service<ServiceInput<tokio::io::DuplexStream>> {
+        crate::server::TlsAcceptorLayer::new(config).into_layer(EchoService::new())
+    }
+
     #[tokio::test]
     async fn plaintext_tunnel_bypass_rejects_later_tls_activation() {
-        let transport = service_fn(async |input: ServiceInput<()>| {
-            let (stream, _peer) = tokio::io::duplex(64);
-            Ok::<_, ConnectionError>(EstablishedClientConnection {
-                input,
-                conn: ServiceInput::new(stream),
-            })
-        });
-        let connector = TlsConnector::tunnel(transport, None);
-        let established = connector.serve(ServiceInput::new(())).await.unwrap();
-        let reuse = established
-            .conn
-            .extensions()
-            .get_ref::<ConnectionReuse>()
-            .unwrap();
-        let next = Extensions::new();
-        assert!(reuse.matches(&next));
-        next.insert(TlsTunnel {
-            server_identity: Some(Host::from_static("proxy.example")),
-            application_protocol: Some(Protocol::HTTPS),
-            alpn: None,
-        });
-        assert!(!reuse.matches(&next));
+        test_utils::plaintext_tunnel_bypass_rejects_later_tls_activation(tunnel).await;
     }
 
     #[tokio::test]
     async fn discovery_rejects_incompatible_defaults_before_dial() {
-        for base in [
-            TlsClientConfig::new().with_server_verify(ServerVerifyMode::Disable),
-            TlsClientConfig::new().with_server_name(Host::from_static("other.example")),
-        ] {
-            let transport = service_fn(
-                async |_input: ConnectRequest| -> Result<
-                    EstablishedClientConnection<
-                        ServiceInput<tokio::io::DuplexStream>,
-                        ConnectRequest,
-                    >,
-                    ConnectionError,
-                > {
-                    panic!("incompatible authentication must be rejected before dialing");
-                },
-            );
-            let connector = TlsConnector::auto(transport).with_base_config(base);
-            let input = origin_attempt();
-            let attempt = input.extensions().get_arc::<ConnectionAttempt>().unwrap();
-            let error = connector.serve(input).await.expect_err("policy rejection");
-            assert_eq!(error.domain(), ConnectionErrorDomain::Local);
-            assert_eq!(error.kind(), ConnectionErrorKind::Unavailable);
-            assert_eq!(attempt.policy_scope(), ConnectionPolicyScope::Connector);
-        }
+        test_utils::discovery_rejects_incompatible_defaults_before_dial(auto).await;
     }
 
     #[tokio::test]
     async fn discovery_rejects_inner_connector_plaintext_downgrade() {
-        let transport = service_fn(async |mut input: ConnectRequest| {
-            input.application_protocol = Some(Protocol::HTTP);
-            Ok::<_, ConnectionError>(EstablishedClientConnection {
-                input,
-                conn: ServiceInput::new(tokio::io::duplex(64).0),
-            })
-        });
-        let connector = TlsConnector::auto(transport);
-        let error = connector
-            .serve(origin_attempt())
-            .await
-            .expect_err("plaintext rejection");
-        assert_eq!(error.domain(), ConnectionErrorDomain::Local);
-        assert_eq!(error.kind(), ConnectionErrorKind::Unavailable);
+        test_utils::discovery_rejects_inner_connector_plaintext_downgrade(auto).await;
+    }
+
+    #[tokio::test]
+    async fn discovery_rechecks_inner_connector_tls_overrides() {
+        test_utils::discovery_rechecks_inner_connector_tls_overrides(secure).await;
+    }
+
+    #[tokio::test]
+    async fn successful_origin_handshake_reports_effective_policy_scope() {
+        test_utils::successful_origin_handshake_reports_effective_policy_scope(
+            secure,
+            server_auth,
+            acceptor,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn tunnel_handshake_uses_proxy_base_and_keeps_version_scoped() {
+        test_utils::tunnel_handshake_uses_proxy_base_and_keeps_version_scoped(
+            tunnel,
+            server_auth,
+            acceptor,
+        )
+        .await;
     }
 
     #[test]
@@ -1029,39 +1019,6 @@ mod tests {
                 .policy_scope(),
             ConnectionPolicyScope::Request
         );
-    }
-
-    #[tokio::test]
-    async fn discovery_rechecks_inner_connector_tls_overrides() {
-        for disable_verification in [false, true] {
-            let transport = service_fn(move |input: ConnectRequest| async move {
-                if disable_verification {
-                    input
-                        .extensions()
-                        .insert(TlsServerVerify(ServerVerifyMode::Disable));
-                } else {
-                    input
-                        .extensions()
-                        .insert(TlsServerName(Host::from_static("other.example")));
-                }
-                let (io, peer) = tokio::io::duplex(64);
-                drop(peer);
-                Ok::<_, ConnectionError>(EstablishedClientConnection {
-                    input,
-                    conn: ServiceInput::new(io),
-                })
-            });
-            let connector = TlsConnector::secure(transport);
-            let input = origin_attempt();
-            let attempt = input.extensions().get_arc::<ConnectionAttempt>().unwrap();
-            let error = connector
-                .serve(input)
-                .await
-                .expect_err("policy rejection before handshake");
-            assert_eq!(error.domain(), ConnectionErrorDomain::Local);
-            assert_eq!(error.kind(), ConnectionErrorKind::Unavailable);
-            assert_eq!(attempt.policy_scope(), ConnectionPolicyScope::Request);
-        }
     }
 
     #[test]
@@ -1116,135 +1073,6 @@ mod tests {
             .expect("connector data");
 
         assert_eq!(data.server_name, Some(host));
-    }
-
-    #[tokio::test]
-    async fn successful_origin_handshake_reports_effective_policy_scope() {
-        let (cert_chain, private_key) =
-            generate_server_auth(GeneratedServerAuthConfig::default()).expect("server auth");
-        let trust_anchor = cert_chain.last().expect("trust anchor").clone();
-        let server = Arc::new(
-            crate::server::TlsAcceptorLayer::new(
-                TlsServerConfig::new()
-                    .with_alpn_http_auto()
-                    .with_single_cert(ServerAuthData {
-                        cert_chain,
-                        private_key,
-                        ocsp: None,
-                    }),
-            )
-            .into_layer(EchoService::new()),
-        );
-        let base = TlsClientConfig::new()
-            .with_server_name(Host::from_static("localhost"))
-            .try_with_server_trust_anchors([trust_anchor])
-            .expect("trust anchor");
-
-        for request_override in [false, true] {
-            let (client_io, server_io) = tokio::io::duplex(64);
-            let server = server.clone();
-            let server_task =
-                tokio::spawn(async move { server.serve(ServiceInput::new(server_io)).await });
-            let client_io = Arc::new(tokio::sync::Mutex::new(Some(client_io)));
-            let transport = service_fn(move |input: ConnectRequest| {
-                let client_io = client_io.clone();
-                async move {
-                    let conn = ServiceInput::new(client_io.lock().await.take().expect("one dial"));
-                    Ok::<_, ConnectionError>(EstablishedClientConnection { input, conn })
-                }
-            });
-            let connector = TlsConnector::secure(transport).with_base_config(base.clone());
-            let input = ConnectRequest::new(HostWithPort::new(Host::from_static("localhost"), 443))
-                .with_application_protocol(Protocol::HTTPS);
-            #[cfg(feature = "http")]
-            {
-                // A fallback does not constrain ALPN, but an explicit target does.
-                input
-                    .extensions()
-                    .insert(rama_net::http::FallbackHttpVersion(Version::HTTP_11));
-                if request_override {
-                    input
-                        .extensions()
-                        .insert(TargetHttpVersion(Version::HTTP_11));
-                }
-            }
-            if request_override {
-                input
-                    .extensions()
-                    .insert(TlsServerVerify(ServerVerifyMode::Auto));
-                input.extensions().insert(
-                    ConnectionAttempt::new()
-                        .with_authenticated_peer(Host::from_static("localhost")),
-                );
-            }
-            let established = tokio::time::timeout(Duration::from_secs(5), connector.serve(input))
-                .await
-                .expect("handshake timeout")
-                .expect("origin handshake");
-            assert_eq!(
-                established
-                    .conn
-                    .extensions()
-                    .get_ref::<ConnectionPolicyScope>()
-                    .copied(),
-                Some(if request_override {
-                    ConnectionPolicyScope::Request
-                } else {
-                    ConnectionPolicyScope::Connector
-                }),
-            );
-            #[cfg(feature = "http")]
-            {
-                let expected = if request_override {
-                    Version::HTTP_11
-                } else {
-                    Version::HTTP_2
-                };
-                assert_eq!(
-                    established
-                        .conn
-                        .extensions()
-                        .get_ref::<TargetHttpVersion>()
-                        .map(|v| v.0),
-                    Some(expected),
-                );
-                assert_eq!(
-                    established
-                        .conn
-                        .extensions()
-                        .get_ref::<NegotiatedTlsParameters>()
-                        .and_then(|params| params.application_layer_protocol.as_ref()),
-                    Some(&ApplicationProtocol::try_from(expected).unwrap()),
-                );
-                assert_eq!(
-                    established
-                        .input
-                        .extensions()
-                        .get_ref::<TargetHttpVersion>()
-                        .map(|v| v.0),
-                    request_override.then_some(Version::HTTP_11),
-                );
-            }
-            let reuse = established
-                .conn
-                .extensions()
-                .get_ref::<ConnectionReuse>()
-                .expect("native TLS connector publishes reuse policy");
-            let same = Extensions::new();
-            if request_override {
-                same.insert(TlsServerVerify(ServerVerifyMode::Auto));
-            }
-            assert!(reuse.is_reusable());
-            assert!(reuse.matches(&same));
-            let changed = same.fork();
-            changed.insert(TlsServerVerify(ServerVerifyMode::Disable));
-            assert!(!reuse.matches(&changed));
-            drop(established);
-            let _server_result = tokio::time::timeout(Duration::from_secs(5), server_task)
-                .await
-                .expect("server shutdown")
-                .expect("server task");
-        }
     }
 
     #[test]
@@ -1400,140 +1228,6 @@ mod tests {
             effective.get_ref::<TlsAlpn>().cloned(),
             Some(TlsAlpn::empty())
         );
-    }
-
-    #[tokio::test]
-    async fn tunnel_handshake_uses_proxy_base_and_keeps_version_scoped() {
-        use rama_core::{ServiceInput, service::service_fn};
-        use rama_crypto::cert::generate_server_auth;
-        use rama_net::{client::EstablishedClientConnection, stream::service::EchoService};
-        use rama_tls::{
-            ProtocolVersion,
-            client::{ServerVerifyMode, TlsServerCertPins},
-            server::{GeneratedServerAuthConfig, ServerAuthData, TlsServerConfig},
-        };
-        use std::sync::Arc;
-
-        let (cert_chain, private_key) =
-            generate_server_auth(GeneratedServerAuthConfig::default()).expect("server auth");
-        let trust_anchor = cert_chain.last().expect("trust anchor").clone();
-        let server_pin = cert_chain.first().expect("leaf certificate").clone();
-        let server = crate::server::TlsAcceptorLayer::new(
-            TlsServerConfig::new()
-                .with_single_cert(ServerAuthData {
-                    cert_chain,
-                    private_key,
-                    ocsp: None,
-                })
-                .with_alpn_http_2(),
-        )
-        .into_layer(EchoService::new());
-
-        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
-        let server_task =
-            tokio::spawn(async move { server.serve(ServiceInput::new(server_io)).await });
-        let client_io = Arc::new(parking_lot::Mutex::new(Some(client_io)));
-        let transport = service_fn(move |input: ServiceInput<()>| {
-            let conn = ServiceInput::new(client_io.lock().take().expect("one connection"));
-            async move { Ok::<_, ConnectionError>(EstablishedClientConnection { input, conn }) }
-        });
-        let proxy_base = TlsClientConfig::new()
-            .with_alpn_http_2()
-            .with_server_name(Host::from_static("localhost"))
-            .with_server_cert_pins(TlsServerCertPins::new(server_pin))
-            .with_server_verify(ServerVerifyMode::Auto)
-            .try_with_server_trust_anchors([trust_anchor])
-            .expect("proxy trust")
-            .with_supported_versions(vec![ProtocolVersion::TLSv1_3]);
-        let connector = TlsConnector::tunnel(transport, None).with_base_config(proxy_base);
-
-        let input = ServiceInput::new(());
-        input.extensions().insert(
-            ConnectionAttempt::new().with_authenticated_peer(Host::from_static("origin.example")),
-        );
-        TlsClientConfig::new()
-            .with_alpn_http_1()
-            .with_server_name(Host::from_static("origin.example"))
-            .with_server_verify(ServerVerifyMode::Disable)
-            .with_server_cert_pins(TlsServerCertPins::new(CertificateDer::from(vec![9])))
-            .write_to(input.extensions());
-        #[cfg(feature = "http")]
-        input
-            .extensions()
-            .insert(TargetHttpVersion(Version::HTTP_11));
-        input.extensions().insert(TlsTunnel {
-            server_identity: Some(Host::from_static("proxy-route.example")),
-            application_protocol: Some(Protocol::HTTPS),
-            alpn: None,
-        });
-
-        let established = connector.serve(input).await.expect("proxy TLS handshake");
-        let reuse = established
-            .conn
-            .extensions()
-            .get_ref::<ConnectionReuse>()
-            .expect("proxy TLS connector publishes reuse policy");
-        let next_origin = Extensions::new();
-        next_origin.insert(TlsServerName(Host::from_static("another-origin.example")));
-        next_origin.insert(TlsServerVerify(ServerVerifyMode::Disable));
-        assert!(reuse.is_reusable());
-        assert!(!reuse.matches(&next_origin));
-        next_origin.insert(
-            established
-                .input
-                .extensions()
-                .get_ref::<TlsTunnel>()
-                .unwrap()
-                .clone(),
-        );
-        assert!(reuse.matches(&next_origin));
-        next_origin.insert(TlsTunnel {
-            server_identity: None,
-            application_protocol: None,
-            alpn: None,
-        });
-        assert!(!reuse.matches(&next_origin));
-        assert_eq!(
-            established
-                .input
-                .extensions()
-                .get_ref::<ConnectionAttempt>()
-                .unwrap()
-                .policy_scope(),
-            ConnectionPolicyScope::Unknown,
-        );
-        assert!(
-            !established
-                .conn
-                .extensions()
-                .contains::<ConnectionPolicyScope>()
-        );
-        let negotiated = established
-            .conn
-            .extensions()
-            .get_ref::<NegotiatedTlsParameters>()
-            .expect("proxy TLS parameters");
-        assert_eq!(negotiated.resumed, Some(false));
-        assert_eq!(negotiated.server_name, None);
-        assert_eq!(
-            negotiated.application_layer_protocol,
-            Some(ApplicationProtocol::HTTP_2)
-        );
-        #[cfg(feature = "http")]
-        assert!(
-            established
-                .conn
-                .extensions()
-                .get_ref::<TargetHttpVersion>()
-                .is_none()
-        );
-        drop(established);
-        // The client is dropped immediately after the handshake assertions,
-        // so the TLS server may finish with an EOF/close-notify error.
-        let _server_result = tokio::time::timeout(std::time::Duration::from_secs(5), server_task)
-            .await
-            .expect("server shutdown")
-            .expect("server task");
     }
 
     #[tokio::test]

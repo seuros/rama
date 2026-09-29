@@ -53,6 +53,7 @@ tokio-rustls = { workspace = true }
 webpki-roots = { workspace = true }
 
 [dev-dependencies]
+rama-tls = { workspace = true, features = ["test-utils"] }
 
 [lints]
 workspace = true
